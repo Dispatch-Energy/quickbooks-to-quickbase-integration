@@ -1,0 +1,11 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "FUNCTIONS_WORKER_RUNTIME": "python",
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "QUICKBASE_REALM": "dispatchenergy",
+    "QUICKBASE_TOKEN": "your-quickbase-token",
+    "QUICKBASE_TABLE_ID": "bxxxxxxxx",
+    "ALERT_WEBHOOK_URL": ""
+  }
+}

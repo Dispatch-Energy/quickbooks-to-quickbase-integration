@@ -1,0 +1,25 @@
+# Dockerfile for QB Scraper with Playwright Auto-Login
+#
+# Based on official Playwright image with Chromium pre-installed
+# Runs: auto-login (Playwright) → scrape (HTTP) → sync (QuickBase)
+
+FROM mcr.microsoft.com/playwright/python:v1.48.0-jammy
+
+WORKDIR /app
+
+# Environment
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+
+# Install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY qb_auto_login.py .
+COPY qb_http_scraper.py .
+COPY runner.py .
+
+# Run the main script
+ENTRYPOINT ["python", "runner.py"]
