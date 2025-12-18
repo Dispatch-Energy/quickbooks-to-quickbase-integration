@@ -73,28 +73,79 @@ def auto_login() -> Dict[str, str]:
     logging.info("Starting Playwright auto-login...")
     
     with sync_playwright() as p:
+        # Launch with more anti-detection measures
         browser = p.chromium.launch(
             headless=True,
             args=[
+                '--disable-blink-features=AutomationControlled',
                 '--disable-dev-shm-usage',
                 '--no-sandbox',
-                '--disable-blink-features=AutomationControlled',
-                '--disable-gpu',
+                '--disable-web-security',
+                '--disable-features=IsolateOrigins,site-per-process',
+                '--disable-infobars',
+                '--window-size=1920,1080',
+                '--start-maximized',
             ]
         )
+        
+        # Create context with realistic fingerprint
         context = browser.new_context(
-            user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Safari/605.1.15',
-            viewport={'width': 1280, 'height': 800},
-            timezone_id='America/Denver'
+            user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            viewport={'width': 1920, 'height': 1080},
+            timezone_id='America/Denver',
+            locale='en-US',
+            color_scheme='light',
+            java_script_enabled=True,
+            has_touch=False,
+            is_mobile=False,
         )
+        
+        # Add stealth scripts to mask automation
+        context.add_init_script("""
+            // Mask webdriver
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            
+            // Mask plugins
+            Object.defineProperty(navigator, 'plugins', {
+                get: () => [1, 2, 3, 4, 5]
+            });
+            
+            // Mask languages
+            Object.defineProperty(navigator, 'languages', {
+                get: () => ['en-US', 'en']
+            });
+            
+            // Mask chrome
+            window.chrome = { runtime: {} };
+            
+            // Mask permissions
+            const originalQuery = window.navigator.permissions.query;
+            window.navigator.permissions.query = (parameters) => (
+                parameters.name === 'notifications' ?
+                    Promise.resolve({ state: Notification.permission }) :
+                    originalQuery(parameters)
+            );
+        """)
+        
         page = context.new_page()
+        
+        # Random mouse movements to look human
+        def human_mouse_move():
+            import random
+            for _ in range(random.randint(2, 5)):
+                x = random.randint(100, 800)
+                y = random.randint(100, 600)
+                page.mouse.move(x, y)
+                time.sleep(random.uniform(0.1, 0.3))
         
         logging.info("Navigating to QuickBooks...")
         page.goto('https://qbo.intuit.com', timeout=60000)
         human_delay(3, 5)
+        human_mouse_move()
         
         if 'qbo.intuit.com/app/' not in page.url:
             logging.info(f"On login page: {page.url}")
+            human_mouse_move()
             
             # Check for remembered account tile
             account_tile = page.query_selector(f'text="{QB_USERNAME}"')
@@ -109,14 +160,32 @@ def auto_login() -> Dict[str, str]:
                     '[data-testid="IdentifierFirstInternationalUserIdInput"]',
                     timeout=15000
                 )
+                
+                # Move mouse to input before clicking
+                box = email_input.bounding_box()
+                if box:
+                    page.mouse.move(box['x'] + box['width']/2, box['y'] + box['height']/2)
+                    time.sleep(random.uniform(0.2, 0.5))
+                
                 human_delay(0.5, 1)
                 email_input.click()
                 human_delay(0.3, 0.7)
-                page.keyboard.type(QB_USERNAME, delay=random.randint(80, 150))
+                
+                # Type with variable speed
+                for char in QB_USERNAME:
+                    page.keyboard.type(char, delay=random.randint(50, 150))
+                    if random.random() < 0.1:  # Occasional pause
+                        time.sleep(random.uniform(0.1, 0.3))
+                
                 human_delay(0.5, 1.5)
+                human_mouse_move()
                 
                 signin_btn = page.query_selector('[data-testid="IdentifierFirstSubmitButton"]')
                 if signin_btn:
+                    box = signin_btn.bounding_box()
+                    if box:
+                        page.mouse.move(box['x'] + box['width']/2, box['y'] + box['height']/2)
+                        time.sleep(random.uniform(0.2, 0.4))
                     signin_btn.click()
                 human_delay(3, 5)
             
@@ -144,27 +213,93 @@ def auto_login() -> Dict[str, str]:
                 else:
                     raise Exception(f"Login stuck at: {current_url}. Page text: {page_text[:200]}")
             human_delay(0.5, 1)
+            
+            # Move to password field
+            box = password_input.bounding_box()
+            if box:
+                page.mouse.move(box['x'] + box['width']/2, box['y'] + box['height']/2)
+                time.sleep(random.uniform(0.2, 0.5))
+            
             password_input.click()
             human_delay(0.3, 0.7)
-            page.keyboard.type(QB_PASSWORD, delay=random.randint(80, 150))
+            
+            # Type password with variable speed
+            for char in QB_PASSWORD:
+                page.keyboard.type(char, delay=random.randint(50, 150))
+                if random.random() < 0.1:
+                    time.sleep(random.uniform(0.1, 0.3))
+            
             human_delay(0.5, 1.5)
+            human_mouse_move()
             
             signin_btn = page.query_selector('button[type="submit"]')
             if signin_btn:
+                box = signin_btn.bounding_box()
+                if box:
+                    page.mouse.move(box['x'] + box['width']/2, box['y'] + box['height']/2)
+                    time.sleep(random.uniform(0.2, 0.4))
                 signin_btn.click()
             
             # Wait for redirect
             logging.info("Waiting for redirect...")
             try:
-                page.wait_for_url('**/qbo.intuit.com/app/**', timeout=60000)
+                page.wait_for_url('**/qbo.intuit.com/app/**', timeout=15000)
                 logging.info("Login successful!")
             except:
-                page_content = page.content().lower()
-                if 'captcha' in page_content or 'robot' in page_content:
+                # Take screenshot to see what screen we're on
+                screenshot_bytes = page.screenshot()
+                
+                # Save to blob storage if available
+                try:
+                    from azure.storage.blob import BlobServiceClient
+                    conn_str = os.getenv('AzureWebJobsStorage')
+                    if conn_str:
+                        blob_service = BlobServiceClient.from_connection_string(conn_str)
+                        container = blob_service.get_container_client('screenshots')
+                        try:
+                            container.create_container()
+                        except:
+                            pass
+                        blob_name = f"login_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+                        container.upload_blob(blob_name, screenshot_bytes, overwrite=True)
+                        logging.info(f"Screenshot saved to blob: {blob_name}")
+                except Exception as e:
+                    logging.warning(f"Could not save screenshot to blob: {e}")
+                
+                # Check what page we're on
+                current_url = page.url
+                page_text = page.inner_text('body')[:1000] if page.query_selector('body') else ''
+                logging.info(f"Current URL: {current_url}")
+                logging.info(f"Page text: {page_text}")
+                
+                # Check for verification screen
+                if 'verify' in page_text.lower() or "verify it's you" in page_text.lower():
+                    logging.info("Device verification screen detected!")
+                    
+                    # Click "Text a code" button
+                    text_code_btn = page.query_selector('text="Text a code"')
+                    if text_code_btn:
+                        logging.info("Clicking 'Text a code'...")
+                        text_code_btn.click()
+                        human_delay(2, 3)
+                        
+                        # Take another screenshot
+                        screenshot_bytes = page.screenshot()
+                        try:
+                            blob_name = f"sms_sent_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+                            container.upload_blob(blob_name, screenshot_bytes, overwrite=True)
+                            logging.info(f"Screenshot saved: {blob_name}")
+                        except:
+                            pass
+                        
+                        raise Exception("SMS_VERIFICATION_REQUIRED")
+                    else:
+                        raise Exception(f"Verification required but couldn't find 'Text a code' button. Page: {page_text[:200]}")
+                
+                elif 'captcha' in page_text.lower() or 'robot' in page_text.lower():
                     raise Exception("CAPTCHA triggered - manual intervention required")
-                if 'verification' in page_content or 'security code' in page_content:
-                    raise Exception("2FA/MFA required - cannot automate")
-                raise Exception(f"Login failed - stuck on: {page.url}")
+                else:
+                    raise Exception(f"Login stuck at: {current_url}. Page: {page_text[:200]}")
         
         # Navigate to banking
         human_delay(2, 3)
@@ -487,17 +622,4 @@ def qb_sync_manual(req: func.HttpRequest) -> func.HttpResponse:
         account_map = sync_accounts(accounts)
         sync_transactions(transactions, account_map)
         
-        return func.HttpResponse(
-            f"Sync complete: {len(accounts)} accounts, {len(transactions)} transactions",
-            status_code=200
-        )
-        
-    except Exception as e:
-        logging.error(f"Sync failed: {e}")
-        return func.HttpResponse(f"Sync failed: {e}", status_code=500)
-
-
-@app.route(route="health", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
-def health_check(req: func.HttpRequest) -> func.HttpResponse:
-    """Health check endpoint."""
-    return func.HttpResponse("OK", status_code=200)
+        return func
