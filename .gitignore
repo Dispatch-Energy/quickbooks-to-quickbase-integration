@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.env
+.venv
+venv/
+ENV/
+
+# Azure Functions
+local.settings.json
+.python_packages/
+bin/
+obj/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets
+*.pem
+*.key
+secrets.txt
+# Local Tests
+*.csv
+*.json
+*.txt
+*.log
+*.err
+*.out
+*.err
+*.out
+*.err
+*.out
