@@ -622,4 +622,54 @@ def qb_sync_manual(req: func.HttpRequest) -> func.HttpResponse:
         account_map = sync_accounts(accounts)
         sync_transactions(transactions, account_map)
         
-        return func
+        return func.HttpResponse(
+            f"Sync complete: {len(accounts)} accounts, {len(transactions)} transactions",
+            status_code=200
+        )
+        
+    except Exception as e:
+        logging.error(f"Sync failed: {e}")
+        return func.HttpResponse(f"Sync failed: {e}", status_code=500)
+
+
+@app.route(route="health", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
+def health_check(req: func.HttpRequest) -> func.HttpResponse:
+    """Health check endpoint."""
+    return func.HttpResponse("OK", status_code=200)
+
+
+@app.route(route="screenshot", methods=["GET"], auth_level=func.AuthLevel.FUNCTION)
+def get_screenshot(req: func.HttpRequest) -> func.HttpResponse:
+    """Get the latest screenshot from blob storage."""
+    try:
+        from azure.storage.blob import BlobServiceClient
+        
+        conn_str = os.getenv('AzureWebJobsStorage')
+        if not conn_str:
+            return func.HttpResponse("No storage configured", status_code=500)
+        
+        blob_service = BlobServiceClient.from_connection_string(conn_str)
+        container = blob_service.get_container_client('screenshots')
+        
+        # List blobs and get the most recent
+        blobs = list(container.list_blobs())
+        if not blobs:
+            return func.HttpResponse("No screenshots found", status_code=404)
+        
+        # Sort by name (which includes timestamp) and get latest
+        blobs.sort(key=lambda x: x.name, reverse=True)
+        latest_blob = blobs[0]
+        
+        # Download and return
+        blob_data = container.download_blob(latest_blob.name).readall()
+        
+        return func.HttpResponse(
+            blob_data,
+            status_code=200,
+            mimetype="image/png",
+            headers={"Content-Disposition": f"inline; filename={latest_blob.name}"}
+        )
+        
+    except Exception as e:
+        logging.error(f"Screenshot fetch failed: {e}")
+        return func.HttpResponse(f"Error: {e}", status_code=500)
