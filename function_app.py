@@ -122,10 +122,27 @@ def auto_login() -> Dict[str, str]:
             
             # Enter password
             logging.info("Entering password...")
-            password_input = page.wait_for_selector(
-                'input[type="password"]:not([data-testid="SignInHiddenInput"])',
-                timeout=15000
-            )
+            try:
+                password_input = page.wait_for_selector(
+                    'input[type="password"]:not([data-testid="SignInHiddenInput"])',
+                    timeout=15000
+                )
+            except Exception as e:
+                # Log what's on the page for debugging
+                current_url = page.url
+                page_text = page.inner_text('body')[:500] if page.query_selector('body') else 'No body'
+                
+                logging.error(f"Password field not found!")
+                logging.error(f"Current URL: {current_url}")
+                logging.error(f"Page text: {page_text}")
+                
+                # Check for common issues
+                if 'captcha' in page_text.lower() or 'robot' in page_text.lower():
+                    raise Exception("CAPTCHA detected - Azure IP may be flagged")
+                elif 'verify' in page_text.lower() or 'security' in page_text.lower():
+                    raise Exception("Security verification required")
+                else:
+                    raise Exception(f"Login stuck at: {current_url}. Page text: {page_text[:200]}")
             human_delay(0.5, 1)
             password_input.click()
             human_delay(0.3, 0.7)
