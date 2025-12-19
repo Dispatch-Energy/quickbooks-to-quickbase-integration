@@ -673,3 +673,208 @@ def get_screenshot(req: func.HttpRequest) -> func.HttpResponse:
     except Exception as e:
         logging.error(f"Screenshot fetch failed: {e}")
         return func.HttpResponse(f"Error: {e}", status_code=500)
+
+
+@app.route(route="verify", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
+def submit_verification_code(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Submit SMS verification code to complete login.
+    
+    Usage: curl -X POST ".../api/verify?code=FUNC_KEY" -d '{"sms_code": "123456"}'
+    """
+    try:
+        req_body = req.get_json()
+        sms_code = req_body.get('sms_code', '').strip()
+        
+        if not sms_code or len(sms_code) != 6:
+            return func.HttpResponse("Invalid code. Send JSON: {\"sms_code\": \"123456\"}", status_code=400)
+        
+        logging.info(f"Submitting verification code: {sms_code[:2]}****")
+        
+        # Run the full sync with the SMS code
+        result = run_sync_with_verification(sms_code)
+        
+        return func.HttpResponse(result, status_code=200)
+        
+    except ValueError:
+        return func.HttpResponse("Invalid JSON. Send: {\"sms_code\": \"123456\"}", status_code=400)
+    except Exception as e:
+        logging.error(f"Verification failed: {e}")
+        return func.HttpResponse(f"Error: {e}", status_code=500)
+
+
+def run_sync_with_verification(sms_code: str) -> str:
+    """Run the full sync flow, entering SMS code if verification screen appears."""
+    logging.info("Starting sync with verification code...")
+    
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                '--disable-blink-features=AutomationControlled',
+                '--disable-dev-shm-usage',
+                '--no-sandbox',
+                '--disable-web-security',
+                '--disable-features=IsolateOrigins,site-per-process',
+                '--disable-infobars',
+                '--window-size=1920,1080',
+                '--start-maximized',
+            ]
+        )
+        
+        context = browser.new_context(
+            user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            viewport={'width': 1920, 'height': 1080},
+            timezone_id='America/Denver',
+            locale='en-US',
+        )
+        
+        context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+            window.chrome = { runtime: {} };
+        """)
+        
+        page = context.new_page()
+        
+        def human_mouse_move():
+            for _ in range(random.randint(2, 5)):
+                x = random.randint(100, 800)
+                y = random.randint(100, 600)
+                page.mouse.move(x, y)
+                time.sleep(random.uniform(0.1, 0.3))
+        
+        logging.info("Navigating to QuickBooks...")
+        page.goto('https://qbo.intuit.com', timeout=60000)
+        human_delay(3, 5)
+        human_mouse_move()
+        
+        if 'qbo.intuit.com/app/' not in page.url:
+            logging.info(f"On login page: {page.url}")
+            human_mouse_move()
+            
+            # Enter email
+            account_tile = page.query_selector(f'text="{QB_USERNAME}"')
+            if account_tile:
+                logging.info("Found remembered account - clicking...")
+                account_tile.click()
+                human_delay(2, 3)
+            else:
+                logging.info("Entering email...")
+                email_input = page.wait_for_selector(
+                    '[data-testid="IdentifierFirstInternationalUserIdInput"]',
+                    timeout=15000
+                )
+                box = email_input.bounding_box()
+                if box:
+                    page.mouse.move(box['x'] + box['width']/2, box['y'] + box['height']/2)
+                    time.sleep(random.uniform(0.2, 0.5))
+                email_input.click()
+                human_delay(0.3, 0.7)
+                for char in QB_USERNAME:
+                    page.keyboard.type(char, delay=random.randint(50, 150))
+                human_delay(0.5, 1.5)
+                
+                signin_btn = page.query_selector('[data-testid="IdentifierFirstSubmitButton"]')
+                if signin_btn:
+                    signin_btn.click()
+                human_delay(3, 5)
+            
+            # Enter password
+            logging.info("Entering password...")
+            password_input = page.wait_for_selector(
+                'input[type="password"]:not([data-testid="SignInHiddenInput"])',
+                timeout=15000
+            )
+            box = password_input.bounding_box()
+            if box:
+                page.mouse.move(box['x'] + box['width']/2, box['y'] + box['height']/2)
+                time.sleep(random.uniform(0.2, 0.5))
+            password_input.click()
+            human_delay(0.3, 0.7)
+            for char in QB_PASSWORD:
+                page.keyboard.type(char, delay=random.randint(50, 150))
+            human_delay(0.5, 1.5)
+            
+            signin_btn = page.query_selector('button[type="submit"]')
+            if signin_btn:
+                signin_btn.click()
+            
+            human_delay(3, 5)
+            
+            # Check for verification screen
+            page_text = page.inner_text('body').lower() if page.query_selector('body') else ''
+            
+            if 'verification code' in page_text or 'check your text' in page_text:
+                logging.info("Verification screen detected - entering SMS code...")
+                
+                # Find and fill the code input
+                code_input = page.query_selector('input[type="text"], input[type="tel"], input[placeholder*="code"], input[aria-label*="code"]')
+                if not code_input:
+                    code_input = page.query_selector('input')
+                
+                if code_input:
+                    code_input.click()
+                    human_delay(0.3, 0.5)
+                    for char in sms_code:
+                        page.keyboard.type(char, delay=random.randint(100, 200))
+                    human_delay(0.5, 1)
+                    
+                    # Click Continue
+                    continue_btn = page.query_selector('button:has-text("Continue"), button[type="submit"]')
+                    if continue_btn:
+                        continue_btn.click()
+                        logging.info("Clicked Continue...")
+                    
+                    human_delay(3, 5)
+                else:
+                    raise Exception("Could not find verification code input")
+            
+            # Wait for app
+            try:
+                page.wait_for_url('**/qbo.intuit.com/app/**', timeout=30000)
+                logging.info("Login successful!")
+            except:
+                screenshot_bytes = page.screenshot()
+                save_screenshot(screenshot_bytes, "verify_failed")
+                raise Exception(f"Login failed after verification. URL: {page.url}")
+        
+        # Navigate to banking
+        page.goto('https://qbo.intuit.com/app/banking', timeout=30000)
+        human_delay(3, 5)
+        
+        # Get cookies
+        cookies = {}
+        for c in context.cookies():
+            if 'intuit.com' in c.get('domain', ''):
+                cookies[c['name']] = c['value']
+        
+        browser.close()
+        
+        # Now do the sync
+        logging.info("Starting QuickBase sync...")
+        accounts, transactions = scrape_quickbooks(cookies)
+        account_map = sync_accounts(accounts)
+        sync_transactions(transactions, account_map)
+        
+        return f"Sync complete: {len(accounts)} accounts, {len(transactions)} transactions"
+
+
+def save_screenshot(screenshot_bytes: bytes, prefix: str = "screenshot"):
+    """Save screenshot to blob storage."""
+    try:
+        from azure.storage.blob import BlobServiceClient
+        conn_str = os.getenv('AzureWebJobsStorage')
+        if conn_str:
+            blob_service = BlobServiceClient.from_connection_string(conn_str)
+            container = blob_service.get_container_client('screenshots')
+            try:
+                container.create_container()
+            except:
+                pass
+            blob_name = f"{prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+            container.upload_blob(blob_name, screenshot_bytes, overwrite=True)
+            logging.info(f"Screenshot saved: {blob_name}")
+    except Exception as e:
+        logging.warning(f"Could not save screenshot: {e}")
