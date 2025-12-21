@@ -31,7 +31,12 @@ Thumbs.db
 secrets.txt
 # Local Tests
 *.csv
-logs/*
+logs/
+__pycache__/
+*.py[cod]
+.env
+.venv/
+*.log
 
 *.log
 *.err
