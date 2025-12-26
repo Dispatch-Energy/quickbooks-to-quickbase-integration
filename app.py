@@ -172,18 +172,39 @@ def save_screenshot(screenshot_bytes: bytes):
 
 def run_sync() -> str:
     """Run the full sync flow."""
+    import sys
+    
     logger.info("Starting sync...")
+    print("=== SYNC STARTED ===", flush=True)
     start_time = time.time()
     
-    cookies = auto_login()
-    accounts, transactions = scrape_quickbooks(cookies)
-    account_map = sync_accounts(accounts)
-    sync_transactions(transactions, account_map)
-    
-    elapsed = time.time() - start_time
-    result = f"{len(accounts)} accounts, {len(transactions)} transactions ({elapsed:.1f}s)"
-    logger.info(f"Sync complete: {result}")
-    return result
+    try:
+        print("Step 1: Logging in...", flush=True)
+        cookies = auto_login()
+        print(f"Step 2: Got cookies, company_id={cookies.get('qbo.currentcompanyid')}", flush=True)
+        
+        print("Step 3: Scraping QuickBooks...", flush=True)
+        accounts, transactions = scrape_quickbooks(cookies)
+        print(f"Step 4: Scraped {len(accounts)} accounts, {len(transactions)} transactions", flush=True)
+        
+        print("Step 5: Syncing accounts to QuickBase...", flush=True)
+        account_map = sync_accounts(accounts)
+        print(f"Step 6: Account map has {len(account_map)} entries", flush=True)
+        
+        print("Step 7: Syncing transactions...", flush=True)
+        sync_transactions(transactions, account_map)
+        print("Step 8: Done!", flush=True)
+        
+        elapsed = time.time() - start_time
+        result = f"{len(accounts)} accounts, {len(transactions)} transactions ({elapsed:.1f}s)"
+        logger.info(f"Sync complete: {result}")
+        print(f"=== SYNC COMPLETE: {result} ===", flush=True)
+        return result
+        
+    except Exception as e:
+        print(f"=== SYNC ERROR: {e} ===", flush=True)
+        logger.error(f"Sync error: {e}")
+        raise
 
 
 def auto_login() -> Dict[str, str]:
@@ -423,6 +444,7 @@ def scrape_quickbooks(cookies: Dict[str, str]):
 
 def quickbase_request(method: str, endpoint: str, data: dict = None):
     """Make QuickBase API request."""
+    print(f"QuickBase API: {method} {endpoint}", flush=True)
     resp = requests.request(
         method,
         f'https://api.quickbase.com/v1/{endpoint}',
@@ -434,6 +456,9 @@ def quickbase_request(method: str, endpoint: str, data: dict = None):
         json=data,
         timeout=30
     )
+    print(f"QuickBase response: {resp.status_code}", flush=True)
+    if resp.status_code not in [200, 207]:
+        print(f"QuickBase error: {resp.text[:500]}", flush=True)
     return resp
 
 
