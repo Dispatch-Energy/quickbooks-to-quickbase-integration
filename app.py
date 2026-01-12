@@ -141,7 +141,7 @@ def get_screenshot():
 
 @app.post("/sync")
 def trigger_sync(req: SyncRequest = None):
-    """Trigger bank feeds sync. If verification needed, waits up to 3 min for /code."""
+    """Trigger full sync (bank feeds + GL). If verification needed, waits up to 3 min for /code."""
     if state.sync_in_progress:
         return {"status": "already_running", "message": "Sync already in progress"}
     
@@ -163,10 +163,16 @@ def trigger_sync(req: SyncRequest = None):
         skip_balances = req.skip_balances if req else False
         skip_transactions = req.skip_transactions if req else False
         
-        result = run_bank_feeds_sync(
+        # Run bank feeds first
+        bank_result = run_bank_feeds_sync(
             skip_balances=skip_balances,
             skip_transactions=skip_transactions
         )
+        
+        # Then run GL sync
+        gl_result = run_gl_sync()
+        
+        result = f"Bank feeds: {bank_result} | GL: {gl_result}"
         state.last_sync_result = result
         return {"status": "complete", "result": result}
         
