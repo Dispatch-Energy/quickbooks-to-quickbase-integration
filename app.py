@@ -1,9 +1,11 @@
 """
-QuickBooks → QuickBase Sync - Container App
+QuickBooks → QuickBase Sync - Container App (v2)
 
 FastAPI app with endpoints:
-- POST /sync - trigger sync (waits for SMS code if needed)
-- POST /code - submit SMS code
+- POST /sync - trigger bank feeds sync (accounts, balances, transactions)
+- POST /sync-gl - trigger GL sync (OAuth-based)
+- POST /sync-all - trigger both bank feeds + GL sync
+- POST /code - submit SMS verification code
 - GET /screenshot - view latest screenshot
 - GET /health - health check
 """
@@ -13,7 +15,7 @@ import time
 import random
 import logging
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 from typing import Dict, List, Optional
 from contextlib import asynccontextmanager
 
@@ -41,22 +43,34 @@ QB_BASE_URL = 'https://qbo.intuit.com'
 
 QUICKBASE_REALM = os.getenv('QUICKBASE_REALM', 'dispatchenergy')
 QUICKBASE_TOKEN = os.getenv('QUICKBASE_TOKEN')
+
+# Bank feeds tables
 ACCOUNTS_TABLE_ID = os.getenv('ACCOUNTS_TABLE_ID')
 TRANSACTIONS_TABLE_ID = os.getenv('TRANSACTIONS_TABLE_ID')
+BALANCES_TABLE_ID = os.getenv('BALANCES_TABLE_ID')  # NEW: Bank Balance table
 
+# Bank Account field mappings
 ACCOUNT_FIELDS = {
     'quickbooks_id': 6, 'account_name': 7, 'nickname': 8, 'institution': 9,
     'type': 10, 'balance': 11, 'qb_balance': 12, 'pending_txns': 13,
     'last_updated': 14, 'last_synced': 15,
 }
 
+# Bank Transaction field mappings
 TRANSACTION_FIELDS = {
     'quickbooks_id': 6, 'internal_id': 7, 'date': 8, 'description': 9,
     'amount': 10, 'type': 11, 'merchant_name': 12, 'related_account': 13,
 }
 
+# Bank Balance field mappings (NEW)
+BALANCE_FIELDS = {
+    'balance': 6,            # Currency
+    'date_added': 7,         # Date
+    'related_account': 8,    # Reference to Bank Account
+}
+
 # =============================================================================
-# In-memory state (simpler than blob storage)
+# In-memory state
 # =============================================================================
 
 class AppState:
@@ -74,20 +88,30 @@ state = AppState()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("QB Sync Container App starting...")
+    logger.info("QB Sync Container App v2 starting...")
     yield
     logger.info("Shutting down...")
 
-app = FastAPI(title="QB Sync", lifespan=lifespan)
+app = FastAPI(title="QB Sync v2", lifespan=lifespan)
 
 
 class CodeRequest(BaseModel):
     sms_code: str
 
 
+class SyncRequest(BaseModel):
+    skip_balances: bool = False
+    skip_transactions: bool = False
+
+
 @app.get("/health")
 def health_check():
-    return {"status": "ok", "sync_in_progress": state.sync_in_progress}
+    return {
+        "status": "ok", 
+        "sync_in_progress": state.sync_in_progress,
+        "version": "2.0",
+        "features": ["bank_feeds", "bank_balances", "gl_sync"]
+    }
 
 
 @app.post("/code")
@@ -116,8 +140,8 @@ def get_screenshot():
 
 
 @app.post("/sync")
-def trigger_sync(background_tasks: BackgroundTasks):
-    """Trigger sync. If verification needed, waits up to 3 min for /code."""
+def trigger_sync(req: SyncRequest = None):
+    """Trigger bank feeds sync. If verification needed, waits up to 3 min for /code."""
     if state.sync_in_progress:
         return {"status": "already_running", "message": "Sync already in progress"}
     
@@ -132,12 +156,76 @@ def trigger_sync(background_tasks: BackgroundTasks):
     if missing:
         raise HTTPException(500, f"Missing config: {', '.join(missing)}")
     
-    # Run sync (blocking for now - Container Apps handle long requests fine)
     try:
         state.sync_in_progress = True
         state.pending_sms_code = None
         
-        result = run_sync()
+        skip_balances = req.skip_balances if req else False
+        skip_transactions = req.skip_transactions if req else False
+        
+        result = run_bank_feeds_sync(
+            skip_balances=skip_balances,
+            skip_transactions=skip_transactions
+        )
+        state.last_sync_result = result
+        return {"status": "complete", "result": result}
+        
+    except Exception as e:
+        error_msg = str(e)
+        state.last_sync_result = f"Error: {error_msg}"
+        
+        if "SMS_VERIFICATION_TIMEOUT" in error_msg:
+            raise HTTPException(408, "Verification timeout - no code received within 3 minutes")
+        elif "SMS_VERIFICATION_REQUIRED" in error_msg:
+            raise HTTPException(202, "SMS sent - POST to /code with {\"sms_code\": \"123456\"}")
+        else:
+            raise HTTPException(500, error_msg)
+    finally:
+        state.sync_in_progress = False
+
+
+@app.post("/sync-gl")
+def trigger_gl_sync():
+    """Trigger GL sync (OAuth-based, for accounting data)."""
+    if state.sync_in_progress:
+        return {"status": "already_running", "message": "Sync already in progress"}
+    
+    try:
+        state.sync_in_progress = True
+        result = run_gl_sync()
+        state.last_sync_result = result
+        return {"status": "complete", "result": result}
+    except Exception as e:
+        error_msg = str(e)
+        state.last_sync_result = f"Error: {error_msg}"
+        raise HTTPException(500, error_msg)
+    finally:
+        state.sync_in_progress = False
+
+
+@app.post("/sync-all")
+def trigger_full_sync(req: SyncRequest = None):
+    """Trigger both bank feeds and GL sync."""
+    if state.sync_in_progress:
+        return {"status": "already_running", "message": "Sync already in progress"}
+    
+    try:
+        state.sync_in_progress = True
+        state.pending_sms_code = None
+        
+        skip_balances = req.skip_balances if req else False
+        skip_transactions = req.skip_transactions if req else False
+        
+        # Run bank feeds first
+        bank_result = run_bank_feeds_sync(
+            skip_balances=skip_balances,
+            skip_transactions=skip_transactions
+        )
+        
+        # Then run GL sync
+        gl_result = run_gl_sync()
+        
+        result = f"Bank feeds: {bank_result} | GL: {gl_result}"
         state.last_sync_result = result
         return {"status": "complete", "result": result}
         
@@ -156,7 +244,7 @@ def trigger_sync(background_tasks: BackgroundTasks):
 
 
 # =============================================================================
-# Sync Logic
+# Helper Functions
 # =============================================================================
 
 def human_delay(min_sec=1, max_sec=3):
@@ -170,12 +258,14 @@ def save_screenshot(screenshot_bytes: bytes):
     logger.info(f"Screenshot saved at {state.screenshot_timestamp}")
 
 
-def run_sync() -> str:
-    """Run the full sync flow."""
-    import sys
-    
-    logger.info("Starting sync...")
-    print("=== SYNC STARTED ===", flush=True)
+# =============================================================================
+# Bank Feeds Sync
+# =============================================================================
+
+def run_bank_feeds_sync(skip_balances: bool = False, skip_transactions: bool = False) -> str:
+    """Run the full bank feeds sync flow."""
+    logger.info("Starting bank feeds sync...")
+    print("=== BANK FEEDS SYNC STARTED ===", flush=True)
     start_time = time.time()
     
     try:
@@ -191,19 +281,31 @@ def run_sync() -> str:
         account_map = sync_accounts(accounts)
         print(f"Step 6: Account map has {len(account_map)} entries", flush=True)
         
-        print("Step 7: Syncing transactions...", flush=True)
-        sync_transactions(transactions, account_map)
-        print("Step 8: Done!", flush=True)
+        # NEW: Sync bank balances
+        if not skip_balances and BALANCES_TABLE_ID:
+            print("Step 7: Syncing bank balances (daily snapshot)...", flush=True)
+            balance_result = sync_bank_balances(accounts, account_map)
+            print(f"Step 7 complete: {balance_result}", flush=True)
+        else:
+            print("Step 7: Skipping bank balances", flush=True)
+            balance_result = "skipped"
+        
+        if not skip_transactions:
+            print("Step 8: Syncing transactions...", flush=True)
+            sync_transactions(transactions, account_map)
+            print("Step 8 complete!", flush=True)
+        else:
+            print("Step 8: Skipping transactions", flush=True)
         
         elapsed = time.time() - start_time
-        result = f"{len(accounts)} accounts, {len(transactions)} transactions ({elapsed:.1f}s)"
-        logger.info(f"Sync complete: {result}")
-        print(f"=== SYNC COMPLETE: {result} ===", flush=True)
+        result = f"{len(accounts)} accounts, {len(transactions)} txns, balances: {balance_result} ({elapsed:.1f}s)"
+        logger.info(f"Bank feeds sync complete: {result}")
+        print(f"=== BANK FEEDS SYNC COMPLETE: {result} ===", flush=True)
         return result
         
     except Exception as e:
-        print(f"=== SYNC ERROR: {e} ===", flush=True)
-        logger.error(f"Sync error: {e}")
+        print(f"=== BANK FEEDS SYNC ERROR: {e} ===", flush=True)
+        logger.error(f"Bank feeds sync error: {e}")
         raise
 
 
@@ -414,7 +516,6 @@ def scrape_quickbooks(cookies: Dict[str, str]):
     all_txns = []
     for acct in accounts:
         acct_id = str(acct.get('qboAccountId', ''))
-        acct_name = acct.get('qboAccountFullName') or acct.get('olbAccountNickname', 'Unknown')
         
         resp = requests.get(
             f'{QB_BASE_URL}/api/neo/v1/company/{company_id}/olb/ng/getTransactions',
@@ -522,6 +623,95 @@ def sync_accounts(accounts: List) -> Dict[str, int]:
     return account_map
 
 
+def sync_bank_balances(accounts: List, account_map: Dict[str, int]) -> str:
+    """
+    Sync daily bank balance snapshots to QuickBase.
+    
+    Creates one record per account per day. Checks for existing records
+    to prevent duplicates if run multiple times on the same day.
+    """
+    logger.info("Syncing bank balances (daily snapshot)...")
+    
+    if not BALANCES_TABLE_ID:
+        logger.warning("BALANCES_TABLE_ID not set, skipping")
+        return "skipped (no table)"
+    
+    today = date.today().isoformat()  # YYYY-MM-DD format
+    
+    records = []
+    skipped = 0
+    
+    for acct in accounts:
+        acct_id = str(acct.get('qboAccountId', ''))
+        parent_record_id = account_map.get(acct_id)
+        
+        if not parent_record_id:
+            skipped += 1
+            continue
+        
+        # Get balance (prefer bank balance, fall back to QB balance)
+        balance = float(acct.get('bankBalance', 0) or 0)
+        if balance == 0:
+            balance = float(acct.get('qboBalance', 0) or 0)
+        
+        records.append({
+            str(BALANCE_FIELDS['balance']): {'value': balance},
+            str(BALANCE_FIELDS['date_added']): {'value': today},
+            str(BALANCE_FIELDS['related_account']): {'value': parent_record_id},
+        })
+    
+    if skipped:
+        logger.info(f"Skipped {skipped} accounts (no matching parent)")
+    
+    if not records:
+        return "no records"
+    
+    # Check for existing balances for today
+    logger.info(f"Checking for existing balances on {today}...")
+    
+    existing_check = quickbase_request('POST', 'records/query', {
+        'from': BALANCES_TABLE_ID,
+        'select': [3, BALANCE_FIELDS['date_added'], BALANCE_FIELDS['related_account']],
+        'where': f"{{{BALANCE_FIELDS['date_added']}.EX.'{today}'}}"
+    })
+    
+    existing_accounts = set()
+    if existing_check.status_code == 200:
+        for rec in existing_check.json().get('data', []):
+            acct_ref = rec.get(str(BALANCE_FIELDS['related_account']), {}).get('value')
+            if acct_ref:
+                existing_accounts.add(acct_ref)
+    
+    if existing_accounts:
+        logger.info(f"Found {len(existing_accounts)} existing balance records for today")
+        original_count = len(records)
+        records = [
+            r for r in records 
+            if r[str(BALANCE_FIELDS['related_account'])]['value'] not in existing_accounts
+        ]
+        logger.info(f"Filtered to {len(records)} new balance records")
+    
+    if not records:
+        return "already synced today"
+    
+    # Insert balance records
+    logger.info(f"Inserting {len(records)} balance snapshot records...")
+    
+    resp = quickbase_request('POST', 'records', {
+        'to': BALANCES_TABLE_ID,
+        'data': records,
+    })
+    
+    if resp.status_code == 200:
+        meta = resp.json().get('metadata', {})
+        created = len(meta.get('createdRecordIds', []))
+        logger.info(f"Created {created} balance records")
+        return f"{created} created"
+    else:
+        logger.error(f"Balance sync failed: {resp.status_code}")
+        return f"error: {resp.status_code}"
+
+
 def sync_transactions(transactions: List, account_map: Dict[str, int]):
     """Sync transactions to QuickBase."""
     logger.info("Syncing transactions...")
@@ -556,7 +746,7 @@ def sync_transactions(transactions: List, account_map: Dict[str, int]):
     
     # Batch upsert
     for i in range(0, len(records), 1000):
-        batch = records[i:i+1000]
+        batch = records[i:i + 1000]
         quickbase_request('POST', 'records', {
             'to': TRANSACTIONS_TABLE_ID,
             'data': batch,
@@ -564,6 +754,55 @@ def sync_transactions(transactions: List, account_map: Dict[str, int]):
         })
     
     logger.info(f"Synced {len(records)} transactions")
+
+
+# =============================================================================
+# GL Sync (OAuth-based)
+# =============================================================================
+
+def run_gl_sync() -> str:
+    """
+    Run GL sync using the OAuth-based integration.
+    
+    Requires OAuth tokens already set up and environment variables:
+    - QB_CLIENT_ID, QB_CLIENT_SECRET
+    - QUICKBASE_APP_ID
+    """
+    logger.info("Starting GL sync...")
+    
+    try:
+        from qb_to_quickbase_sync import (
+            load_config, TokenStore, QBOAuth, QuickBaseClient, SyncEngine
+        )
+    except ImportError:
+        logger.warning("qb_to_quickbase_sync.py not found")
+        return "skipped (module not found)"
+    
+    config = load_config()
+    if not config:
+        logger.warning("GL sync config not found")
+        return "skipped (no config)"
+    
+    token_store = TokenStore()
+    tokens = token_store.get_all()
+    
+    if not tokens:
+        logger.warning("No OAuth tokens found")
+        return "skipped (no tokens)"
+    
+    logger.info(f"Found {len(tokens)} connected companies")
+    
+    oauth = QBOAuth(config.client_id, config.client_secret, token_store)
+    qb_client = QuickBaseClient(
+        realm=config.quickbase_realm,
+        token=config.quickbase_token,
+        app_id=config.quickbase_app_id
+    )
+    
+    engine = SyncEngine(oauth, qb_client)
+    engine.sync_all()
+    
+    return f"synced {len(tokens)} companies"
 
 
 # =============================================================================

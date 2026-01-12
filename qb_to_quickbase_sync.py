@@ -556,8 +556,8 @@ QUICKBASE_SCHEMA = {
             'table_id': 'bvnw8sq6r',
             'qb_entity': None,
             'parent_entity': 'Invoice',
-            'unique_key_field': None,
-            'parent_ref_field': 15,
+            'unique_key_field': 21,
+            'parent_ref_field': 12,
             'fields': {
                 'Items': 6,
                 'Description': 7,
@@ -565,7 +565,8 @@ QUICKBASE_SCHEMA = {
                 'Quantity': 9,
                 'Unit Price': 10,
                 'Amount': 11,
-                'Related Invoice (ref)': 15,
+                'Related Invoice': 12,
+                'QB_UniqueKey': 21,
             }
         },
         'Bills': {
@@ -598,12 +599,12 @@ QUICKBASE_SCHEMA = {
             'qb_entity': None,
             'parent_entity': 'Bill',
             'unique_key_field': 18,
-            'parent_ref_field': 15,
+            'parent_ref_field': 9,
             'fields': {
                 'Line Number': 6,
                 'Description': 7,
                 'Amount': 8,
-                'Related Bill (ref)': 15,
+                'Related Bill': 9,
                 'QB_UniqueKey': 18,
             }
         },
@@ -670,12 +671,12 @@ QUICKBASE_SCHEMA = {
             'qb_entity': None,
             'parent_entity': 'JournalEntry',
             'unique_key_field': 16,
-            'parent_ref_field': 13,
+            'parent_ref_field': 9,
             'fields': {
                 'LineNum': 6,
                 'Posting Type': 7,
                 'Amount': 8,
-                'Related Journal Entry (ref)': 13,
+                'Related Journal Entry': 9,
                 'QB_UniqueKey': 16,
                 'Account': 17,
             }
@@ -976,7 +977,12 @@ class QuickBaseClient:
         if not table_config:
             return {'created': 0, 'updated': 0}
         
+        parent_table_config = QUICKBASE_SCHEMA['tables'].get(parent_table_name)
+        if not parent_table_config:
+            return {'created': 0, 'updated': 0}
+        
         table_id = table_config['table_id']
+        parent_table_id = parent_table_config['table_id']
         fields = table_config['fields']
         
         # Get unique key field from schema
@@ -984,14 +990,47 @@ class QuickBaseClient:
         if not unique_key_field_id:
             unique_key_field_id = self._get_or_create_unique_key_field(table_id, table_name)
         
-        # Get parent reference field (links line to parent via QB ID)
+        # Get parent reference field (links line to parent via Record ID#)
         parent_ref_field = table_config.get('parent_ref_field')
+        
+        # Get parent's unique key field
+        parent_unique_key_field = parent_table_config.get('unique_key_field')
+        
+        # Build mapping of QB_UniqueKey → Record ID# for parents
+        parent_record_map = {}
+        if parent_ref_field and parent_unique_key_field:
+            # Query parent table to get the mapping
+            response = requests.post(
+                f"{self.base_url}/records/query",
+                headers=self._get_headers(),
+                json={
+                    'from': parent_table_id,
+                    'select': [3, parent_unique_key_field],  # Record ID# and QB_UniqueKey
+                }
+            )
+            
+            if response.status_code == 200:
+                for record in response.json().get('data', []):
+                    unique_key = record.get(str(parent_unique_key_field), {}).get('value')
+                    record_id = record.get('3', {}).get('value')
+                    if unique_key and record_id:
+                        parent_record_map[unique_key] = record_id
+                logger.info(f"  Built parent mapping: {len(parent_record_map)} {parent_table_name} records")
         
         # Extract line items
         all_lines = []
+        skipped_no_parent = 0
+        
         for parent in parent_records:
             parent_id = parent.get('Id')
             parent_unique_key = f"{parent_id}_{realm_id}"
+            
+            # Look up the parent's QuickBase Record ID#
+            parent_record_id = parent_record_map.get(parent_unique_key)
+            if not parent_record_id and parent_ref_field:
+                skipped_no_parent += 1
+                continue
+            
             lines = parent.get('Line', [])
             
             for idx, line in enumerate(lines):
@@ -1001,9 +1040,9 @@ class QuickBaseClient:
                 line_record = {}
                 line_num = line.get('LineNum', idx)
                 
-                # Link to parent via QB_UniqueKey
-                if parent_ref_field:
-                    line_record[str(parent_ref_field)] = {'value': parent_unique_key}
+                # Link to parent via Record ID# (numeric)
+                if parent_ref_field and parent_record_id:
+                    line_record[str(parent_ref_field)] = {'value': parent_record_id}
                 
                 # Common line fields
                 if 'LineNum' in fields:
@@ -1049,6 +1088,9 @@ class QuickBaseClient:
                 
                 if line_record:
                     all_lines.append(line_record)
+        
+        if skipped_no_parent:
+            logger.warning(f"  Skipped {skipped_no_parent} parents (not found in QuickBase)")
         
         if not all_lines:
             return {'created': 0, 'updated': 0}
