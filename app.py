@@ -452,12 +452,19 @@ def auto_login() -> Dict[str, str]:
                                     human_delay(3, 5)
                                 
                                 try:
-                                    page.wait_for_url('**/qbo.intuit.com/app/**', timeout=30000)
+                                    page.wait_for_url('**/qbo.intuit.com/app/**', timeout=60000)
                                     logger.info("Verification successful!")
                                     break
                                 except:
+                                    # Check if we're actually logged in despite timeout
                                     save_screenshot(page.screenshot())
-                                    raise Exception("Verification failed after entering code")
+                                    current_url = page.url
+                                    if 'qbo.intuit.com/app/' in current_url:
+                                        logger.info(f"Verification successful (fallback check): {current_url}")
+                                        break
+                                    else:
+                                        logger.error(f"Verification failed. Current URL: {current_url}")
+                                        raise Exception("Verification failed after entering code")
                             else:
                                 raise Exception("Could not find code input field")
                         
