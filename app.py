@@ -2,15 +2,17 @@
 QuickBooks → QuickBase Sync - Container App (v2)
 
 FastAPI app with endpoints:
-- POST /sync - trigger bank feeds sync (accounts, balances, transactions)
+- POST /sync - trigger full sync (bank feeds + GL)
 - POST /sync-gl - trigger GL sync (OAuth-based)
 - POST /sync-all - trigger both bank feeds + GL sync
-- POST /code - submit SMS verification code
+- POST /code - submit SMS verification code (manual)
+- POST /twilio/sms - Twilio webhook for automatic SMS code capture
 - GET /screenshot - view latest screenshot
 - GET /health - health check
 """
 
 import os
+import re
 import time
 import random
 import logging
@@ -19,8 +21,8 @@ from datetime import datetime, timezone, date
 from typing import Dict, List, Optional
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks
-from fastapi.responses import Response
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Form, Request
+from fastapi.responses import Response, PlainTextResponse
 from pydantic import BaseModel
 from playwright.sync_api import sync_playwright
 import requests
@@ -124,6 +126,41 @@ def submit_code(req: CodeRequest):
     state.pending_sms_code = code
     logger.info(f"SMS code received: {code[:2]}****")
     return {"status": "received", "message": "Code stored - sync will continue"}
+
+
+@app.post("/twilio/sms")
+async def twilio_sms_webhook(
+    From: str = Form(...),
+    Body: str = Form(...),
+    To: str = Form(None),
+    MessageSid: str = Form(None),
+):
+    """
+    Twilio webhook for incoming SMS.
+    Automatically extracts verification code from Intuit SMS messages.
+    """
+    logger.info(f"Twilio SMS received from {From}: {Body[:50]}...")
+    
+    # Extract 6-digit code from message body
+    # Intuit messages typically contain: "Your Intuit verification code is 123456"
+    code_match = re.search(r'\b(\d{6})\b', Body)
+    
+    if code_match:
+        code = code_match.group(1)
+        state.pending_sms_code = code
+        logger.info(f"Extracted verification code: {code[:2]}****")
+        
+        # Return TwiML response (empty response = no reply SMS)
+        return PlainTextResponse(
+            content='<?xml version="1.0" encoding="UTF-8"?><Response></Response>',
+            media_type="application/xml"
+        )
+    else:
+        logger.warning(f"No 6-digit code found in SMS: {Body}")
+        return PlainTextResponse(
+            content='<?xml version="1.0" encoding="UTF-8"?><Response></Response>',
+            media_type="application/xml"
+        )
 
 
 @app.get("/screenshot")
