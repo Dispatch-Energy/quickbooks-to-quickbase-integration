@@ -1,5 +1,17 @@
-playwright>=1.40.0
+# QB Sync Container App - Requirements
+
+# Web framework
+fastapi>=0.104.0
+uvicorn>=0.24.0
+
+# HTTP requests
 requests>=2.31.0
-fastapi>=0.109.0
-uvicorn>=0.27.0
+
+# Browser automation
+playwright>=1.40.0
+
+# Pydantic (FastAPI dependency, but pin version)
 pydantic>=2.5.0
+
+# Optional: Twilio request validation (uncomment if you want to verify webhook signatures)
+# twilio>=8.10.0
