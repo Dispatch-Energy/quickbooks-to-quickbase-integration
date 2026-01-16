@@ -1,24 +1,28 @@
 #!/usr/bin/env python3
 """
-QuickBooks → QuickBase Sync (v2)
+QuickBooks → QuickBase Sync (v2.1)
 
 1. Login to QuickBooks (browser scrape for bank feeds)
-2. Scrape accounts + pending transactions
-3. Sync to QuickBase:
+2. Optionally trigger bank feed refresh (--refresh-feeds)
+3. Scrape accounts + pending transactions
+4. Sync to QuickBase:
    - Bank accounts (upsert)
    - Bank balances (daily snapshot - insert new record each day)
    - Bank transactions (upsert as children)
-4. Optionally sync GL data via OAuth API
+5. Optionally sync GL data via OAuth API
 
 Usage:
     # Bank feeds only (default)
-    python qb_sync_v2.py
+    python qb_sync.py
+    
+    # Refresh bank feeds before scraping (triggers Update button)
+    python qb_sync.py --refresh-feeds
     
     # Bank feeds + GL sync
-    python qb_sync_v2.py --with-gl
+    python qb_sync.py --with-gl
     
     # GL sync only (requires OAuth tokens already set up)
-    python qb_sync_v2.py --gl-only
+    python qb_sync.py --gl-only
 """
 
 import os
@@ -26,6 +30,7 @@ import sys
 import time
 import random
 import argparse
+import uuid
 from datetime import datetime, timezone, date
 from playwright.sync_api import sync_playwright
 import requests
@@ -87,12 +92,16 @@ BALANCE_FIELDS = {
     'related_account': 8,    # Numeric - reference to Bank Account Record ID#
 }
 
+# Bank Feed Refresh Settings
+REFRESH_POLL_INTERVAL = 15  # seconds between status checks
+REFRESH_TIMEOUT = 600       # max wait time (10 minutes)
+
 
 def human_delay(min_sec=1, max_sec=3):
     time.sleep(random.uniform(min_sec, max_sec))
 
 
-def login():
+def login(headless=False):
     """Login to QuickBooks and return cookies"""
     print("=" * 60)
     print("STEP 1: LOGIN TO QUICKBOOKS")
@@ -100,7 +109,7 @@ def login():
     
     with sync_playwright() as p:
         browser = p.chromium.launch(
-            headless=False,
+            headless=headless,
             args=['--disable-blink-features=AutomationControlled']
         )
         context = browser.new_context(
@@ -167,12 +176,150 @@ def login():
         return cookies
 
 
-def scrape_quickbooks(cookies):
-    """Scrape accounts and transactions from QuickBooks"""
-    print("\n" + "=" * 60)
-    print("STEP 2: SCRAPE QUICKBOOKS")
+def login_and_watch_refresh(timeout=REFRESH_TIMEOUT):
+    """
+    Login to QuickBooks, trigger refresh via UI, and watch until complete.
+    Keeps browser open so user can observe the update.
+    Returns cookies when done.
+    """
+    print("=" * 60)
+    print("WATCH MODE: LOGIN AND REFRESH BANK FEEDS")
     print("=" * 60)
     
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=False,
+            args=['--disable-blink-features=AutomationControlled']
+        )
+        context = browser.new_context(
+            user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15',
+            viewport={'width': 1280, 'height': 800},
+            timezone_id='America/Denver'
+        )
+        page = context.new_page()
+        
+        print("Navigating to QB...")
+        page.goto('https://qbo.intuit.com', timeout=60000)
+        human_delay(3, 5)
+        
+        if 'qbo.intuit.com/app/' not in page.url:
+            print("Entering email...")
+            email_input = page.wait_for_selector(
+                '[data-testid="IdentifierFirstInternationalUserIdInput"]',
+                timeout=15000
+            )
+            human_delay(0.5, 1)
+            email_input.click()
+            human_delay(0.3, 0.7)
+            page.keyboard.type(QB_USERNAME, delay=random.randint(80, 150))
+            human_delay(0.5, 1.5)
+            
+            signin_btn = page.query_selector('[data-testid="IdentifierFirstSubmitButton"]')
+            if signin_btn:
+                signin_btn.click()
+            human_delay(3, 5)
+            
+            # Check for CAPTCHA
+            if 'captcha' in page.content().lower() or 'robot' in page.content().lower():
+                print("\n⚠️  CAPTCHA detected - please solve it manually...")
+                page.wait_for_selector('input[type="password"]', timeout=120000)
+            
+            print("Entering password...")
+            password_input = page.wait_for_selector(
+                'input[type="password"]:not([data-testid="SignInHiddenInput"])',
+                timeout=15000
+            )
+            human_delay(0.5, 1)
+            password_input.click()
+            human_delay(0.3, 0.7)
+            page.keyboard.type(QB_PASSWORD, delay=random.randint(80, 150))
+            human_delay(0.5, 1.5)
+            
+            signin_btn = page.query_selector('button[type="submit"]')
+            if signin_btn:
+                signin_btn.click()
+            
+            page.wait_for_url('**/qbo.intuit.com/app/**', timeout=60000)
+        
+        human_delay(2, 4)
+        print("Navigating to Banking page...")
+        page.goto('https://qbo.intuit.com/app/banking', timeout=30000)
+        human_delay(3, 5)
+        
+        # Find and click the Update button
+        print("Looking for Update button...")
+        update_btn = page.query_selector('button:has-text("Update")')
+        
+        if not update_btn:
+            # Maybe it's already updating?
+            updating_btn = page.query_selector('button:has-text("Updating")')
+            if updating_btn:
+                print("  Already updating! Will wait for completion...")
+            else:
+                print("  ⚠️ Could not find Update button")
+                # Get cookies anyway
+                cookies = {}
+                for c in context.cookies():
+                    if 'intuit.com' in c.get('domain', ''):
+                        cookies[c['name']] = c['value']
+                browser.close()
+                return cookies
+        else:
+            print("  Clicking Update button...")
+            update_btn.click()
+            human_delay(2, 3)
+        
+        # Wait for "Updating" to appear then disappear
+        print(f"\n  Waiting for update to complete (timeout: {timeout}s)...")
+        print("  Watching for 'Updating' button to change back to 'Update'...")
+        
+        start_time = time.time()
+        
+        # First wait for "Updating" to appear (confirms click worked)
+        try:
+            page.wait_for_selector('button:has-text("Updating")', timeout=10000)
+            print("  ✓ Update started (button shows 'Updating')")
+        except:
+            print("  ⚠️ 'Updating' button not found - may have already completed")
+        
+        # Now wait for it to change back to "Update"
+        while time.time() - start_time < timeout:
+            elapsed = int(time.time() - start_time)
+            
+            # Check if we're back to "Update" button (not "Updating")
+            update_btn = page.query_selector('button:has-text("Update"):not(:has-text("Updating"))')
+            if update_btn:
+                btn_text = update_btn.inner_text()
+                if 'Updating' not in btn_text:
+                    print(f"\n  ✓ Update complete! ({elapsed}s)")
+                    break
+            
+            # Progress indicator
+            if elapsed % 15 == 0:
+                print(f"  [{elapsed}s] Still updating...")
+            
+            time.sleep(1)
+        else:
+            print(f"\n  ⚠️ Timeout after {timeout}s - update may still be in progress")
+        
+        # Get cookies
+        cookies = {}
+        for c in context.cookies():
+            if 'intuit.com' in c.get('domain', ''):
+                cookies[c['name']] = c['value']
+        
+        print(f"\n✓ Got cookies. Company ID: {cookies.get('qbo.currentcompanyid')}")
+        
+        # Give user a moment to see the result
+        print("\n  Browser will close in 5 seconds...")
+        time.sleep(5)
+        
+        browser.close()
+        return cookies
+
+
+def get_qb_headers(cookies):
+    """Build standard QuickBooks API headers"""
     company_id = cookies.get('qbo.currentcompanyid')
     
     headers = {
@@ -184,10 +331,222 @@ def scrape_quickbooks(cookies):
         'Cookie': '; '.join(f'{k}={v}' for k, v in cookies.items()),
         'intuit-company-id': company_id,
         'Referer': f'{QB_BASE_URL}/app/banking',
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Safari/605.1.15',
     }
     
+    # Add CSRF tokens if present
     if cookies.get('qbo.csrftoken'):
         headers['Csrftoken'] = cookies['qbo.csrftoken']
+    
+    if cookies.get('qbo.xcsrfderivationkey'):
+        headers['x-csrf-token'] = cookies['qbo.xcsrfderivationkey']
+    
+    return headers, company_id
+
+
+def trigger_bank_update(cookies):
+    """
+    Trigger QuickBooks bank feed update (equivalent to clicking "Update" button).
+    
+    This starts an async job that contacts each linked bank to refresh transactions.
+    Returns the initial job status response.
+    """
+    print("\n" + "=" * 60)
+    print("STEP 1.5: TRIGGER BANK FEED UPDATE")
+    print("=" * 60)
+    
+    headers, company_id = get_qb_headers(cookies)
+    
+    # Add required headers from captured request
+    headers['intuit-plugin-id'] = 'integrations-datain-ui'
+    headers['intuit_tid'] = str(uuid.uuid4())
+    
+    if cookies.get('qbo.authid'):
+        headers['intuit-user-id'] = cookies['qbo.authid']
+    elif cookies.get('qbo.gauthid'):
+        headers['intuit-user-id'] = cookies['qbo.gauthid']
+    
+    print("Starting bank feed update...")
+    
+    # The actual request body from browser capture
+    body = {"fiList": []}
+    
+    resp = requests.post(
+        f'{QB_BASE_URL}/api/neo/v2/company/{company_id}/olb/manualUpdate/start',
+        headers=headers,
+        json=body,
+        timeout=30
+    )
+    
+    if resp.status_code != 200:
+        print(f"  ✗ Failed to start update: {resp.status_code}")
+        print(f"    Response: {resp.text[:500]}")
+        return None
+    
+    result = resp.json()
+    
+    # Count accounts being updated
+    total_accounts = 0
+    banks = []
+    for sub_job in result.get('subJobs', []):
+        fi_name = sub_job.get('fiName', 'Unknown')
+        num_accounts = len(sub_job.get('accounts', []))
+        total_accounts += num_accounts
+        banks.append(f"{fi_name} ({num_accounts} accounts)")
+    
+    print(f"  ✓ Update started for {len(banks)} banks, {total_accounts} accounts")
+    for bank in banks[:5]:
+        print(f"    - {bank}")
+    if len(banks) > 5:
+        print(f"    ... and {len(banks) - 5} more")
+    
+    return result
+
+
+def poll_update_status(cookies, timeout=REFRESH_TIMEOUT, poll_interval=REFRESH_POLL_INTERVAL):
+    """
+    Poll for bank feed update completion.
+    
+    Returns True if update completed successfully, False otherwise.
+    """
+    headers, company_id = get_qb_headers(cookies)
+    
+    # Add required headers
+    headers['intuit-plugin-id'] = 'integrations-datain-ui'
+    if cookies.get('qbo.authid'):
+        headers['intuit-user-id'] = cookies['qbo.authid']
+    elif cookies.get('qbo.gauthid'):
+        headers['intuit-user-id'] = cookies['qbo.gauthid']
+    
+    print(f"\n  Waiting for update to complete (timeout: {timeout}s)...")
+    
+    start_time = time.time()
+    last_status = {}
+    poll_count = 0
+    use_get = True  # Try GET first
+    
+    # The actual request body from browser capture
+    body = {"fiList": []}
+    
+    while time.time() - start_time < timeout:
+        try:
+            # Generate new transaction ID for each poll
+            headers['intuit_tid'] = str(uuid.uuid4())
+            poll_count += 1
+            
+            # Try GET /status first (less likely to restart job)
+            if use_get:
+                resp = requests.get(
+                    f'{QB_BASE_URL}/api/neo/v2/company/{company_id}/olb/manualUpdate/status',
+                    headers=headers,
+                    timeout=30
+                )
+                if resp.status_code == 404:
+                    print(f"  No /status endpoint, using /start for polling...")
+                    use_get = False
+                    resp = requests.post(
+                        f'{QB_BASE_URL}/api/neo/v2/company/{company_id}/olb/manualUpdate/start',
+                        headers=headers,
+                        json=body,
+                        timeout=30
+                    )
+            else:
+                resp = requests.post(
+                    f'{QB_BASE_URL}/api/neo/v2/company/{company_id}/olb/manualUpdate/start',
+                    headers=headers,
+                    json=body,
+                    timeout=30
+                )
+            
+            if resp.status_code == 200:
+                result = resp.json()
+                is_complete = result.get('isComplete', False)
+                has_errors = result.get('hasErrors', False)
+                
+                # Count completed sub-jobs
+                sub_jobs = result.get('subJobs', [])
+                completed = sum(1 for sj in sub_jobs if sj.get('isComplete', False))
+                total = len(sub_jobs)
+                errors = sum(1 for sj in sub_jobs if sj.get('hasError', False))
+                
+                # Debug: Show first poll's full structure
+                if poll_count == 1:
+                    print(f"  DEBUG: Top-level isComplete={is_complete}, hasErrors={has_errors}")
+                    print(f"  DEBUG: {total} subJobs found")
+                    for sj in sub_jobs[:3]:  # Show first 3
+                        print(f"    - {sj.get('fiName')}: isComplete={sj.get('isComplete')}, hasError={sj.get('hasError')}")
+                    if total > 3:
+                        print(f"    ... and {total - 3} more")
+                
+                # Print progress if changed
+                status_key = (completed, total, errors, is_complete)
+                if status_key != last_status:
+                    elapsed = int(time.time() - start_time)
+                    status_msg = f"  [{elapsed}s] Progress: {completed}/{total} banks complete (isComplete={is_complete})"
+                    if errors:
+                        status_msg += f" ({errors} with errors)"
+                    print(status_msg)
+                    last_status = status_key
+                
+                if is_complete:
+                    print(f"\n  ✓ Update complete! ({int(time.time() - start_time)}s)")
+                    if has_errors:
+                        print("    ⚠️  Some accounts had errors:")
+                        for sj in sub_jobs:
+                            if sj.get('hasError'):
+                                print(f"      - {sj.get('fiName')}")
+                                for acct in sj.get('accounts', []):
+                                    if acct.get('hasError'):
+                                        print(f"        - {acct.get('name')}")
+                    return True
+                
+                # Also check if ALL subJobs are complete even if top-level isn't set
+                if total > 0 and completed == total:
+                    print(f"\n  ✓ All {total} banks complete! ({int(time.time() - start_time)}s)")
+                    return True
+            else:
+                print(f"  Poll {poll_count}: HTTP {resp.status_code}")
+                if use_get and resp.status_code in [404, 405]:
+                    use_get = False
+            
+        except requests.exceptions.RequestException as e:
+            print(f"  ⚠️  Status check failed: {e}")
+        
+        time.sleep(poll_interval)
+    
+    print(f"\n  ✗ Update timed out after {timeout}s")
+    print(f"    Last status: {completed}/{total} complete, isComplete={is_complete}")
+    return False
+
+
+def refresh_bank_feeds(cookies):
+    """
+    Full bank feed refresh cycle: trigger update and wait for completion.
+    
+    Returns True if refresh completed successfully.
+    """
+    # Trigger the update
+    result = trigger_bank_update(cookies)
+    
+    if result is None:
+        return False
+    
+    # If already complete (unlikely but possible)
+    if result.get('isComplete', False):
+        print("  ✓ Update already complete")
+        return True
+    
+    # Poll for completion
+    return poll_update_status(cookies)
+
+
+def scrape_quickbooks(cookies):
+    """Scrape accounts and transactions from QuickBooks"""
+    print("\n" + "=" * 60)
+    print("STEP 2: SCRAPE QUICKBOOKS")
+    print("=" * 60)
+    
+    headers, company_id = get_qb_headers(cookies)
     
     # Get accounts
     print("Fetching accounts...")
@@ -588,21 +947,35 @@ For GL Sync (--with-gl or --gl-only):
 
 Examples:
   # Bank feeds only (accounts, transactions, balances)
-  python qb_sync_v2.py
+  python qb_sync.py
 
-  # Bank feeds + GL sync
-  python qb_sync_v2.py --with-gl
+  # Refresh bank feeds first (triggers Update button, waits ~5 min)
+  python qb_sync.py --refresh-feeds
+  
+  # Refresh with custom timeout
+  python qb_sync.py --refresh-feeds --refresh-timeout 300
+
+  # Bank feeds + GL sync (GL runs during bank feed refresh for efficiency)
+  python qb_sync.py --refresh-feeds --with-gl
 
   # GL sync only
-  python qb_sync_v2.py --gl-only
+  python qb_sync.py --gl-only
         """
     )
     parser.add_argument('--with-gl', action='store_true', 
-                        help='Also run GL sync after bank feeds')
+                        help='Also run GL sync (runs during bank feed refresh if --refresh-feeds)')
     parser.add_argument('--gl-only', action='store_true',
                         help='Run GL sync only (no bank feeds)')
     parser.add_argument('--skip-balances', action='store_true',
                         help='Skip bank balance snapshot sync')
+    parser.add_argument('--refresh-feeds', action='store_true',
+                        help='Trigger bank feed update before scraping (clicks Update button)')
+    parser.add_argument('--refresh-timeout', type=int, default=REFRESH_TIMEOUT,
+                        help=f'Max seconds to wait for bank feed refresh (default: {REFRESH_TIMEOUT})')
+    parser.add_argument('--refresh-only', action='store_true',
+                        help='Only trigger bank feed refresh, do not scrape or sync')
+    parser.add_argument('--watch', action='store_true',
+                        help='Keep browser open to watch the update (non-headless mode)')
     
     args = parser.parse_args()
     
@@ -641,7 +1014,74 @@ Examples:
         sys.exit(1)
     
     # Run bank feeds sync
-    cookies = login()
+    if args.watch and (args.refresh_feeds or args.refresh_only):
+        # Watch mode: use browser for refresh, keeps it open
+        print("\n🔍 WATCH MODE ENABLED - Browser will stay open during update\n")
+        cookies = login_and_watch_refresh(timeout=args.refresh_timeout)
+        
+        if args.refresh_only:
+            print("\n" + "=" * 60)
+            print("✓ BANK FEED REFRESH COMPLETE (watch mode)")
+            print("=" * 60)
+            return
+        
+        # GL sync after refresh
+        if args.with_gl:
+            print("\n")
+            run_gl_sync()
+    else:
+        # Normal mode
+        cookies = login()
+        
+        # Optionally refresh bank feeds
+        if args.refresh_feeds or args.refresh_only:
+            # Step 1: Trigger the update (non-blocking)
+            update_result = trigger_bank_update(cookies)
+            
+            if update_result is None:
+                print("\n⚠️  Bank feed refresh failed to start")
+                if args.refresh_only:
+                    sys.exit(1)
+                print("  Continuing with potentially stale data...")
+            
+            elif update_result.get('isComplete', False):
+                # Already complete (rare but possible)
+                print("  ✓ Update already complete")
+            
+            else:
+                # Step 2: Run GL sync while bank feeds are updating (if requested)
+                if args.with_gl:
+                    print("\n" + "=" * 60)
+                    print("RUNNING GL SYNC WHILE BANK FEEDS UPDATE...")
+                    print("=" * 60)
+                    run_gl_sync()
+                    print("\n" + "=" * 60)
+                    print("✓ GL SYNC COMPLETE - Now waiting for bank feeds...")
+                    print("=" * 60 + "\n")
+                
+                # Step 3: Poll for bank feed completion
+                refresh_success = poll_update_status(
+                    cookies, 
+                    timeout=args.refresh_timeout
+                )
+                
+                if not refresh_success:
+                    print("\n⚠️  Bank feed refresh timed out")
+                    if args.refresh_only:
+                        sys.exit(1)
+                    print("  Continuing with potentially stale data...")
+            
+            if args.refresh_only:
+                print("\n" + "=" * 60)
+                print("✓ BANK FEED REFRESH COMPLETE")
+                print("=" * 60)
+                return
+            
+            # Small delay after refresh before scraping
+            print("\n  Waiting 5 seconds before scraping...")
+            time.sleep(5)
+    
+    # Scrape and sync bank data
     accounts, transactions = scrape_quickbooks(cookies)
     account_map = sync_accounts(accounts)
     
@@ -656,8 +1096,8 @@ Examples:
     print("✓ BANK FEEDS SYNC COMPLETE")
     print("=" * 60)
     
-    # Optionally run GL sync
-    if args.with_gl:
+    # Run GL sync if requested and not already done during refresh
+    if args.with_gl and not args.refresh_feeds:
         print("\n")
         run_gl_sync()
         print("\n" + "=" * 60)
