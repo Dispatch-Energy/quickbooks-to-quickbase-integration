@@ -103,6 +103,10 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="QB Sync v2", lifespan=lifespan)
 
+# Register invoice webhook router
+from invoice_webhook import router as invoice_router
+app.include_router(invoice_router)
+
 
 class CodeRequest(BaseModel):
     sms_code: str

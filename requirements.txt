@@ -16,3 +16,8 @@ pydantic>=2.5.0
 
 # Optional: Twilio request validation (uncomment if you want to verify webhook signatures)
 # twilio>=8.10.0
+
+# Invoice webhook (Acumatica forwarding)
+msal>=1.24.0
+reportlab>=4.0.0
+pypdf>=3.15.0
