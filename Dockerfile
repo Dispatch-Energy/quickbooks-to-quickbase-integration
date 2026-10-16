@@ -27,7 +27,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Install Playwright browsers
 RUN playwright install chromium
 
-COPY app.py .
+COPY app.py invoice_webhook.py ./
 
 EXPOSE 8080
 
