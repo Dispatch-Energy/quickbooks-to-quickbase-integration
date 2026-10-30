@@ -44,3 +44,36 @@ Update action, write balance snapshots, or validate every bank connection.
 Future re-enrollment requires replacing the vault secret and its versioned
 reference together. Unsupported or additional identity challenges still stop
 the configured authenticator flow rather than guessing codes or selecting SMS.
+
+## Observed Azure workflow run
+
+At the owner's request, the existing `qb-sync-scheduler` workflow was manually
+triggered at 21:03 UTC (3:03 PM Mountain). Run ID:
+`08584082127000090059509448732CU91`. The daily scheduled invocation had already
+run at 19:00 UTC, before this authenticator rollout.
+
+The serving revision observed during this run was `qb-sync--0000015`, with image
+tag `c7f373e5b5a9564b0fcce9874b7114d5aad79130`, superseding the initial deployment
+above. Its logs recorded successful authenticator verification at 21:03:49 UTC,
+113 scraped accounts, and 10,562 scraped transactions. Bank sync writes completed
+at approximately 21:05:17 UTC. Independent read-only QuickBase queries confirmed:
+
+| Check | Before | After |
+| --- | --- | --- |
+| Account records | 124 | 124 |
+| Latest account sync timestamp | October 29, 19:03:30 UTC | October 30, 21:05:12 UTC |
+| Accounts bearing the new sync timestamp | — | 113 |
+| October 30 balance snapshots | 0 | 113, for 113 distinct accounts |
+| Transaction records | 12,675 | 12,745 |
+| Latest transaction modification | October 29, 19:03:35 UTC | October 30, 21:05:16 UTC |
+
+The service subsequently returned `sync_in_progress=false`. No phone code was
+supplied. The workflow's existing empty request body did not request the bank-feed
+Update action; this run copied the data already available in QuickBooks. The GL
+step was skipped because `qb_to_quickbase_sync.py` was absent from the container.
+
+The Logic App reported success at 21:05:11 UTC, but its captured response was
+`already_running`, consistent with an HTTP retry while the original request was
+still executing. Scheduler success alone therefore does not prove business
+completion. Logs and durable QuickBase readback establish this run's bank-sync
+completion. No scheduler configuration was changed during observation.
