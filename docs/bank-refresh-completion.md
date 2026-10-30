@@ -15,8 +15,13 @@ a successful `already_running` response. Automatic HTTP retries are disabled.
 The refresh clicks Update once, or joins an already-visible Updating cycle. It
 requires observed progress followed by an enabled Update button stable for two
 seconds. When the browser exposes the manual-update API response, that response
-must also report completion. Missing controls, an unconfirmed start, reported
-bank errors, or timeout stop before bank-data scraping and QuickBase writes.
+must also report completion. Missing controls, an unconfirmed start, HTTP errors,
+or timeout stop before bank-data scraping and QuickBase writes. Once Update
+finishes, failed feeds are held using their source account IDs and connection
+status. Healthy feeds continue; held feeds receive no account, snapshot, or
+transaction writes. Ambiguous status metadata or errors that cannot be mapped
+to held accounts stop the whole run. A completed job reports `outcome=partial`
+and the held count when feeds are excluded, following the owner's policy.
 Completing this process does not guarantee that every bank supplies real-time
 data; institution availability and QuickBooks' source timestamps still matter.
 

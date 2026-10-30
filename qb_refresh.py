@@ -11,6 +11,29 @@ class BankRefreshError(RuntimeError):
     pass
 
 
+def select_healthy_accounts(accounts, refresh_report):
+    """Hold explicit feed failures; reject ambiguous identity/status metadata."""
+    healthy, held, seen = [], [], set()
+    for account in accounts:
+        identity = str(account.get('qboAccountId', ''))
+        if (not identity.isdigit() or identity in seen
+                or 'lastUpdateState' not in account or 'fdpErrorCode' not in account):
+            raise BankRefreshError('BANK_REFRESH_ACCOUNT_STATUS_AMBIGUOUS')
+        seen.add(identity)
+        failed = (account['lastUpdateState'] not in ('Success', 'Unknown')
+                  or account['fdpErrorCode'] not in (None, '', 0, '0')
+                  or account.get('lastTekErrorCode') not in (None, '', 0, '0')
+                  or account.get('lastTekErrorName') not in (None, '', 'NOTANERROR')
+                  or account.get('reconnectOAuthAccount') in (True, 'true', 'True'))
+        (held if failed else healthy).append(account)
+    expected = refresh_report.get('failed_account_count')
+    if refresh_report.get('connection_errors') and (not held or (expected and len(held) < expected)):
+        raise BankRefreshError('BANK_REFRESH_UNMAPPED_CONNECTION_ERRORS')
+    if not healthy:
+        raise BankRefreshError('BANK_REFRESH_NO_HEALTHY_ACCOUNTS')
+    return healthy, held
+
+
 def _visible_button(page, pattern):
     buttons = [b for b in page.get_by_role("button", name=pattern).all()
                if b.is_visible()]
@@ -22,8 +45,8 @@ def _visible_button(page, pattern):
 def wait_for_bank_refresh(page, timeout=600, *, clock=time.monotonic, sleep=time.sleep):
     """Click Update once, then require a witnessed update and an idle control.
 
-    A missing control, an unobserved start, a bank error reported by QuickBooks,
-    or a timeout fails the sync. Never treat the absence of Updating as success.
+    A missing control, an unobserved start, HTTP error, or timeout fails the sync.
+    Completed connection errors are returned for exact downstream account holds.
     """
     # Current QBO labels the button "Updating accounts" / "Update accounts"
     # for accessibility, while its visible child span just says "Updating".
@@ -54,6 +77,8 @@ def wait_for_bank_refresh(page, timeout=600, *, clock=time.monotonic, sleep=time
             observed["api_seen"] = True
             observed["started"] = True
             observed["complete"] = body.get("isComplete") is True
+            logger.info("Bank Update response: complete=%s, banks=%s, failed_banks=%s",
+                        observed['complete'], len(jobs), sum(bool(j.get('hasError')) for j in jobs))
 
     page.on("response", response_received)
     try:
@@ -95,11 +120,11 @@ def wait_for_bank_refresh(page, timeout=600, *, clock=time.monotonic, sleep=time
                     warning = re.search(r"Unable to get transactions for (\d+) accounts?",
                                         page.inner_text('body'), re.I)
                     if observed["failed"] or warning:
-                        count = int(warning.group(1)) if warning else 'unknown'
-                        logger.error("Bank Update finished with connection errors; accounts=%s", count)
-                        raise BankRefreshError("BANK_REFRESH_BANK_ERROR")
+                        count = int(warning.group(1)) if warning else None
+                        logger.warning("Bank Update finished with connection errors; accounts=%s", count)
+                        return {'connection_errors': True, 'failed_account_count': count}
                     logger.info("Bank feed Update completion confirmed")
-                    return
+                    return {'connection_errors': False, 'failed_account_count': 0}
             else:
                 idle_since = None
             if not observed["started"] and clock() >= start_deadline:

@@ -10,7 +10,7 @@ from fastapi import HTTPException
 from starlette.requests import Request
 
 import app
-from qb_refresh import BankRefreshError, wait_for_bank_refresh
+from qb_refresh import BankRefreshError, wait_for_bank_refresh, select_healthy_accounts
 
 
 class Clock:
@@ -66,7 +66,7 @@ class RefreshTests(unittest.TestCase):
     def refresh(self, mode):
         clock = Clock()
         page = Page(clock, mode)
-        wait_for_bank_refresh(page, timeout=40, clock=clock, sleep=clock.sleep)
+        page.report = wait_for_bank_refresh(page, timeout=40, clock=clock, sleep=clock.sleep)
         self.assertIsNone(page.listener)
         return page
 
@@ -84,10 +84,40 @@ class RefreshTests(unittest.TestCase):
 
     def test_missing_unconfirmed_pending_error_and_timeout_fail(self):
         for mode, reason in [('missing', 'CONTROL_MISSING'), ('idle', 'START_NOT_CONFIRMED'),
-                             ('timeout', 'TIMEOUT'), ('bank_error', 'BANK_ERROR'),
-                             ('ui_error', 'BANK_ERROR'), ('api_pending', 'TIMEOUT')]:
+                             ('timeout', 'TIMEOUT'), ('api_pending', 'TIMEOUT')]:
             with self.subTest(mode=mode), self.assertRaisesRegex(BankRefreshError, reason):
                 self.refresh(mode)
+
+    def test_completed_connection_errors_are_reported_for_exact_account_holds(self):
+        for mode in ('bank_error', 'ui_error'):
+            with self.subTest(mode=mode):
+                page = self.refresh(mode)
+                self.assertTrue(page.report['connection_errors'])
+                self.assertGreaterEqual(page.clock(), 2)
+
+
+def feed(identity, state='Success', code=0, **extra):
+    return dict(qboAccountId=identity, lastUpdateState=state, fdpErrorCode=code, **extra)
+
+
+class EligibilityTests(unittest.TestCase):
+    def test_healthy_oauth_unknown_status_and_failed_feeds_are_separated(self):
+        good = [feed('1'), feed('2', 'Unknown', reconnectOAuthAccount=False)]
+        bad = [feed('3', 'Failure', 103), feed('4', 'Failure', 3000),
+               feed('5', lastTekErrorCode=103), feed('6', reconnectOAuthAccount=True)]
+        healthy, held = select_healthy_accounts(good + bad, {'connection_errors': True, 'failed_account_count': 2})
+        self.assertEqual(healthy, good)
+        self.assertEqual(held, bad)
+
+    def test_missing_duplicate_unmapped_or_all_failed_accounts_stop_sync(self):
+        cases = [([{'qboAccountId': '1'}], {}), ([feed('1'), feed('1')], {}),
+                 ([feed('1')], {'connection_errors': True}),
+                 ([feed('1'), feed('2', 'Failure', 103)],
+                  {'connection_errors': True, 'failed_account_count': 2}),
+                 ([feed('1', 'Failure', 103)], {})]
+        for accounts, report in cases:
+            with self.subTest(accounts=accounts), self.assertRaises(BankRefreshError):
+                select_healthy_accounts(accounts, report)
 
 
 def response(data=None, metadata=None, status=200):
@@ -171,6 +201,43 @@ class SyncTests(unittest.TestCase):
             scrape.assert_not_called()
             qb.assert_not_called()
             self.assertFalse(app.state.sync_in_progress)
+
+    def test_failed_feeds_never_reach_account_snapshot_or_transaction_writes(self):
+        good, bad = feed('1'), feed('2', 'Failure', 103)
+        good_txn, bad_txn = {'account_id': '1'}, {'account_id': '2'}
+        session = app.RefreshedSession({'qbo.currentcompanyid': 'test'},
+                                       {'connection_errors': True, 'failed_account_count': 1})
+        with patch.object(app, 'auto_login_and_refresh', return_value=session), \
+             patch.object(app, 'run_gl_sync', return_value='skipped'), \
+             patch.object(app, 'scrape_quickbooks', return_value=([good, bad], [good_txn, bad_txn])), \
+             patch.object(app, 'sync_accounts', return_value={'1': 9, '2': 10}) as accounts, \
+             patch.object(app, 'sync_bank_balances', return_value='0 created, 1 updated') as balances, \
+             patch.object(app, 'sync_transactions') as transactions:
+            result = app.trigger_sync(app.SyncJobRequest())
+        accounts.assert_called_once_with([good])
+        self.assertEqual(balances.call_args.args[0], [good])
+        self.assertTrue(balances.call_args.kwargs['replace_existing'])
+        self.assertEqual(transactions.call_args.args[0], [good_txn])
+        self.assertEqual(result['held_accounts'], 1)
+        self.assertEqual(result['outcome'], 'partial')
+
+    def test_scraper_does_not_request_failed_feed_transactions(self):
+        good, bad = feed('1'), feed('2', 'Failure', 103)
+        initial = Mock(status_code=200, json=lambda: {'accounts': [good, bad]})
+        empty = Mock(status_code=200, json=lambda: {'items': []})
+        with patch.object(app.requests, 'get', side_effect=[initial, empty]) as get:
+            accounts, transactions = app.scrape_quickbooks({'qbo.currentcompanyid': 'test'})
+        self.assertEqual(accounts, [good, bad])
+        self.assertEqual(transactions, [])
+        self.assertEqual(get.call_count, 2)
+        self.assertEqual(get.call_args.kwargs['params']['accountId'], '1')
+
+    def test_failed_healthy_feed_transaction_request_is_not_silently_skipped(self):
+        with patch.object(app.requests, 'get', side_effect=[
+                Mock(status_code=200, json=lambda: {'accounts': [feed('1')]}),
+                Mock(status_code=503)]):
+            with self.assertRaisesRegex(RuntimeError, 'TRANSACTIONS_FAILED_HTTP_503'):
+                app.scrape_quickbooks({'qbo.currentcompanyid': 'test'})
 
     def test_confirmed_refresh_updates_existing_daily_record_and_keeps_zero(self):
         existing = [{'3': {'value': 42}, '8': {'value': 9}}]

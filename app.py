@@ -23,7 +23,7 @@ import logging
 import threading
 import uuid
 from datetime import datetime, timezone, date
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, NamedTuple
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Form, Request
@@ -33,7 +33,7 @@ from playwright.sync_api import sync_playwright
 import requests
 
 from qb_auth import complete_totp_challenge
-from qb_refresh import wait_for_bank_refresh
+from qb_refresh import wait_for_bank_refresh, select_healthy_accounts
 
 # Logging
 logging.basicConfig(
@@ -134,6 +134,11 @@ class SyncJobRequest(SyncRequest):
     refresh_feeds: bool = True
 
 
+class RefreshedSession(NamedTuple):
+    cookies: Dict[str, str]
+    report: dict
+
+
 def validate_sync_config():
     missing = [name for name, value in (
         ('QB_USERNAME', QB_USERNAME), ('QB_PASSWORD', QB_PASSWORD),
@@ -194,7 +199,7 @@ def start_sync_job(request: Request, req: SyncJobRequest = None):
         update = {'status': 'failed', 'error': 'Sync worker interrupted'}
         try:
             result = execute_sync(req)
-            update = {'status': 'complete', 'result': result['result']}
+            update = {**result, 'status': 'complete'}
         except Exception:
             logger.exception('Sync job %s failed', key)
             update = {'status': 'failed', 'error': 'Sync failed; inspect container logs'}
@@ -377,6 +382,7 @@ def execute_sync(req: SyncRequest = None):
         refresh_timeout = req.refresh_timeout if req else REFRESH_BROWSER_TIMEOUT
         
         gl_result = "not run"
+        refresh_report = {}
         
         if refresh_feeds:
             # Browser-based refresh: login, click Update, wait for completion
@@ -399,7 +405,8 @@ def execute_sync(req: SyncRequest = None):
             gl_thread.start()
             
             # Do browser-based login and refresh (this takes ~8 minutes)
-            cookies = auto_login_and_refresh(timeout=refresh_timeout)
+            session = auto_login_and_refresh(timeout=refresh_timeout)
+            cookies, refresh_report = session.cookies, session.report
             
             # Wait for GL sync to complete
             if gl_thread:
@@ -418,6 +425,14 @@ def execute_sync(req: SyncRequest = None):
         print("Step 2: Scraping QuickBooks...", flush=True)
         accounts, transactions = scrape_quickbooks(cookies)
         print(f"Scraped {len(accounts)} accounts, {len(transactions)} transactions", flush=True)
+        source_ids = {str(account.get('qboAccountId')) for account in accounts}
+        if any(str(t['account_id']) not in source_ids for t in transactions):
+            raise RuntimeError('TRANSACTION_ACCOUNT_NOT_IN_SOURCE')
+        accounts, held_accounts = select_healthy_accounts(accounts, refresh_report)
+        eligible_ids = {str(account['qboAccountId']) for account in accounts}
+        transactions = [t for t in transactions if str(t['account_id']) in eligible_ids]
+        logger.info('Eligible bank feeds: %s accounts; holding %s failed accounts',
+                    len(accounts), len(held_accounts))
         
         print("Step 3: Syncing accounts to QuickBase...", flush=True)
         account_map = sync_accounts(accounts)
@@ -434,7 +449,8 @@ def execute_sync(req: SyncRequest = None):
             print("Step 5: Syncing transactions...", flush=True)
             sync_transactions(transactions, account_map)
         
-        bank_result = f"{len(accounts)} accounts, {len(transactions)} txns, balances: {balance_result}"
+        bank_result = (f"{len(accounts)} accounts, {len(transactions)} txns, "
+                       f"balances: {balance_result}; held {len(held_accounts)} failed accounts")
         
         # Run GL sync if not already done during refresh
         if gl_result == "not run":
@@ -443,7 +459,10 @@ def execute_sync(req: SyncRequest = None):
         
         result = f"Bank feeds: {bank_result} | GL: {gl_result}"
         state.last_sync_result = result
-        return {"status": "complete", "result": result}
+        return {"status": "complete", "result": result,
+                "outcome": "partial" if held_accounts else "full",
+                "held_accounts": len(held_accounts), "synced_accounts": len(accounts),
+                "synced_transactions": len(transactions), "refresh_completed": refresh_feeds}
         
     except Exception as e:
         error_msg = str(e)
@@ -685,6 +704,9 @@ def run_bank_feeds_sync(skip_balances: bool = False, skip_transactions: bool = F
         
         print("Step 3: Scraping QuickBooks...", flush=True)
         accounts, transactions = scrape_quickbooks(cookies)
+        accounts, held_accounts = select_healthy_accounts(accounts, {})
+        allowed = {str(account['qboAccountId']) for account in accounts}
+        transactions = [t for t in transactions if str(t['account_id']) in allowed]
         print(f"Step 4: Scraped {len(accounts)} accounts, {len(transactions)} transactions", flush=True)
         
         print("Step 5: Syncing accounts to QuickBase...", flush=True)
@@ -906,11 +928,11 @@ def auto_login() -> Dict[str, str]:
         return cookies
 
 
-def auto_login_and_refresh(timeout: int = REFRESH_BROWSER_TIMEOUT) -> Dict[str, str]:
+def auto_login_and_refresh(timeout: int = REFRESH_BROWSER_TIMEOUT) -> RefreshedSession:
     """
     Login to QuickBooks, trigger bank feed refresh via UI, and wait for completion.
     Uses browser DOM watching instead of API polling for reliability.
-    Returns cookies when done.
+    Returns cookies and a connection-error report after Update has finished.
     """
     logger.info("Starting browser-based login and refresh...")
     print("=== BROWSER-BASED BANK FEED REFRESH ===", flush=True)
@@ -1065,7 +1087,7 @@ def auto_login_and_refresh(timeout: int = REFRESH_BROWSER_TIMEOUT) -> Dict[str, 
         human_delay(3, 5)
         
         try:
-            wait_for_bank_refresh(page, timeout=timeout)
+            refresh_report = wait_for_bank_refresh(page, timeout=timeout)
         except Exception:
             save_screenshot(page.screenshot())
             browser.close()
@@ -1078,7 +1100,7 @@ def auto_login_and_refresh(timeout: int = REFRESH_BROWSER_TIMEOUT) -> Dict[str, 
         logger.info(f"Got session for company: {cookies.get('qbo.currentcompanyid')}")
         
         browser.close()
-        return cookies
+        return RefreshedSession(cookies, refresh_report)
 
 
 def scrape_quickbooks(cookies: Dict[str, str]):
@@ -1109,10 +1131,11 @@ def scrape_quickbooks(cookies: Dict[str, str]):
     
     accounts = resp.json().get('accounts', [])
     logger.info(f"Found {len(accounts)} accounts")
+    healthy_accounts, held_accounts = select_healthy_accounts(accounts, {})
     
     # Transactions
     all_txns = []
-    for acct in accounts:
+    for acct in healthy_accounts:
         acct_id = str(acct.get('qboAccountId', ''))
         
         resp = requests.get(
@@ -1122,7 +1145,7 @@ def scrape_quickbooks(cookies: Dict[str, str]):
             timeout=30
         )
         if resp.status_code != 200:
-            continue
+            raise RuntimeError(f'QUICKBOOKS_TRANSACTIONS_FAILED_HTTP_{resp.status_code}')
         
         for item in resp.json().get('items', []):
             amount = float(item.get('amount', 0))
