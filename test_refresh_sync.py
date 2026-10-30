@@ -36,7 +36,7 @@ class Page:
 
     def wait_for_timeout(self, milliseconds):
         self.clock.sleep(milliseconds / 1000)
-        if self.mode in ('bank_error', 'api_pending', 'api_complete') and self.clicked:
+        if self.mode in ('bank_error', 'api_pending', 'api_complete', 'startup_pending') and self.clicked:
             body = {'subJobs': [{'hasError': self.mode == 'bank_error'}],
                     'isComplete': self.mode in ('api_complete', 'bank_error'),
                     'hasErrors': self.mode == 'bank_error'}
@@ -51,7 +51,7 @@ class Page:
             text = None
         elif self.mode == 'already_running':
             text = 'Updating' if self.clock() < 4 else 'Update'
-        elif self.clicked and self.mode in ('success', 'timeout', 'accessible_label', 'ui_error'):
+        elif self.clicked and self.mode in ('success', 'timeout', 'accessible_label', 'ui_error', 'startup_pending'):
             text = 'Updating' if self.clock() < 4 or self.mode == 'timeout' else 'Update'
         else:
             text = 'Update'
@@ -81,6 +81,9 @@ class RefreshTests(unittest.TestCase):
 
     def test_current_qbo_accessibility_labels(self):
         self.assertEqual(self.refresh('accessible_label').clicked, 1)
+
+    def test_pending_start_snapshot_does_not_block_a_completed_ui_cycle(self):
+        self.assertEqual(self.refresh('startup_pending').clicked, 1)
 
     def test_missing_unconfirmed_pending_error_and_timeout_fail(self):
         for mode, reason in [('missing', 'CONTROL_MISSING'), ('idle', 'START_NOT_CONFIRMED'),

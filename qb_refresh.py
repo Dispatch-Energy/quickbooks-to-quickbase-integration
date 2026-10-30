@@ -54,7 +54,7 @@ def wait_for_bank_refresh(page, timeout=600, *, clock=time.monotonic, sleep=time
     updating = re.compile(r"^Updating(?: accounts)?(?:\.{3}|…)?$", re.I)
     deadline = clock() + timeout
     control_deadline = min(deadline, clock() + 30)
-    observed = {"started": False, "api_seen": False, "complete": False,
+    observed = {"started": False, "busy_seen": False, "api_seen": False, "complete": False,
                 "failed": False, "http_error": False}
 
     def response_received(response):
@@ -87,6 +87,7 @@ def wait_for_bank_refresh(page, timeout=600, *, clock=time.monotonic, sleep=time
             button = _visible_button(page, update)
             if busy:
                 observed["started"] = True
+                observed["busy_seen"] = True
                 logger.info("Bank feed Update is already running; waiting")
                 break
             if button and button.is_enabled():
@@ -110,12 +111,16 @@ def wait_for_bank_refresh(page, timeout=600, *, clock=time.monotonic, sleep=time
             button = _visible_button(page, update)
             if busy:
                 observed["started"] = True
+                observed["busy_seen"] = True
                 idle_since = None
-            elif (observed["started"] and button and button.is_enabled()
-                  and (not observed["api_seen"] or observed["complete"])):
+            elif ((observed['busy_seen'] or observed['complete'])
+                  and button and button.is_enabled()):
                 if idle_since is None:
                     idle_since = clock()
-                # Avoid accepting a transient button rerender as completion.
+                # The start response is a pending snapshot, not a live status
+                # subscription. A witnessed Updating -> Update lifecycle is
+                # authoritative even when that old response remains pending.
+                # A start response alone cannot establish completion.
                 if clock() - idle_since >= 2:
                     warning = re.search(r"Unable to get transactions for (\d+) accounts?",
                                         page.inner_text('body'), re.I)
