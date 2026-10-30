@@ -1,0 +1,104 @@
+"""Confirm the QuickBooks Update lifecycle before allowing downstream writes."""
+
+import logging
+import re
+import time
+
+logger = logging.getLogger(__name__)
+
+
+class BankRefreshError(RuntimeError):
+    pass
+
+
+def _visible_button(page, pattern):
+    buttons = [b for b in page.get_by_role("button", name=pattern).all()
+               if b.is_visible()]
+    if len(buttons) > 1:
+        raise BankRefreshError("BANK_REFRESH_AMBIGUOUS_CONTROL")
+    return buttons[0] if buttons else None
+
+
+def wait_for_bank_refresh(page, timeout=600, *, clock=time.monotonic, sleep=time.sleep):
+    """Click Update once, then require a witnessed update and an idle control.
+
+    A missing control, an unobserved start, a bank error reported by QuickBooks,
+    or a timeout fails the sync. Never treat the absence of Updating as success.
+    """
+    update = re.compile(r"^Update$", re.I)
+    updating = re.compile(r"^Updating(?:\.{3}|…)?$", re.I)
+    deadline = clock() + timeout
+    control_deadline = min(deadline, clock() + 30)
+    observed = {"started": False, "api_seen": False, "complete": False, "failed": False}
+
+    def response_received(response):
+        # Observe the browser's own polling; do not POST another Update job.
+        if "/olb/manualUpdate/" not in response.url:
+            return
+        if response.status >= 400:
+            observed["failed"] = True
+            return
+        try:
+            body = response.json()
+        except Exception:
+            return
+        if not isinstance(body, dict):
+            return
+        jobs = body.get("subJobs", [])
+        if body.get("hasErrors") or any(j.get("hasError") for j in jobs):
+            observed["failed"] = True
+        if jobs:
+            observed["api_seen"] = True
+            observed["started"] = True
+            observed["complete"] = body.get("isComplete") is True
+
+    page.on("response", response_received)
+    try:
+        while True:
+            busy = _visible_button(page, updating)
+            button = _visible_button(page, update)
+            if busy:
+                observed["started"] = True
+                logger.info("Bank feed Update is already running; waiting")
+                break
+            if button and button.is_enabled():
+                logger.info("Clicking bank feed Update")
+                button.click()
+                break
+            if clock() >= control_deadline:
+                raise BankRefreshError("BANK_REFRESH_UPDATE_CONTROL_MISSING")
+            page.wait_for_timeout(250)
+            sleep(0.25)
+
+        start_deadline = min(deadline, clock() + 30)
+        idle_since = None
+        next_progress = clock()
+        while clock() < deadline:
+            # Playwright pumps browser events here, including response callbacks.
+            page.wait_for_timeout(250)
+            if observed["failed"]:
+                raise BankRefreshError("BANK_REFRESH_BANK_ERROR")
+            busy = _visible_button(page, updating)
+            button = _visible_button(page, update)
+            if busy:
+                observed["started"] = True
+                idle_since = None
+            elif (observed["started"] and button and button.is_enabled()
+                  and (not observed["api_seen"] or observed["complete"])):
+                if idle_since is None:
+                    idle_since = clock()
+                # Avoid accepting a transient button rerender as completion.
+                if clock() - idle_since >= 2:
+                    logger.info("Bank feed Update completion confirmed")
+                    return
+            else:
+                idle_since = None
+            if not observed["started"] and clock() >= start_deadline:
+                raise BankRefreshError("BANK_REFRESH_START_NOT_CONFIRMED")
+            if clock() >= next_progress:
+                logger.info("Waiting for bank feed Update completion")
+                next_progress = clock() + 30
+            sleep(0.75)
+        raise BankRefreshError("BANK_REFRESH_TIMEOUT")
+    finally:
+        page.remove_listener("response", response_received)
