@@ -75,15 +75,26 @@ def complete_totp_challenge(page, secret, *, clock=time.time, sleep=time.sleep):
     if "captcha" in text or "robot" in text:
         raise AuthenticatorError("TOTP_INTERACTIVE_CHALLENGE_REQUIRED")
 
-    # Intuit may show a method chooser or an existing SMS challenge first.
-    selected = _click_method(page, r"authenticator")
-    if not selected and "authenticator" not in text:
-        if _click_method(page, r"(try|use|choose).*(another|different|other).*(way|method|option)|more options"):
+    # Observed Intuit route: SMS challenge -> "I didn't get a text message"
+    # -> "See more options" -> method chooser. Never select resend/voice or
+    # the separate identity-recovery process labeled "takes longer".
+    alternate = (
+        r"(try|use|choose).*(another|different|other).*(way|method|option)|"
+        r"more options|try something else|"
+        r"i (?:didn't|didn’t|did not) get (?:a |the )?(?:text message|code)"
+    )
+    for _ in range(3):
+        _require_login_page(page)
+        if _click_method(page, r"authenticator"):
             sleep(1)
-            _require_login_page(page)
-            selected = _click_method(page, r"authenticator")
-    if selected:
+            break
+        if "authenticator" in page.inner_text("body").lower():
+            break
+        if not _click_method(page, alternate):
+            break
         sleep(1)
+        if _signed_in(page):
+            return
     if _signed_in(page):
         return
     _require_login_page(page)

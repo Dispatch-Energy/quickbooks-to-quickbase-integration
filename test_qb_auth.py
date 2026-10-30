@@ -135,6 +135,39 @@ class ChallengeTests(unittest.TestCase):
         self.assertEqual(page.clicked, [])
         self.assertEqual(page.entered, [])
 
+    def test_observed_intuit_nested_method_menus(self):
+        page = LoginPage("Check your text messages")
+        def show_authenticator():
+            page.text = "Enter the code from your authenticator app"
+            page.controls = [Control(page, "Continue")]
+        def show_more():
+            page.text = "Verify it's you"
+            page.controls = [Control(page, "Use authenticator app", on_click=show_authenticator)]
+        def show_methods():
+            page.text = "Verify it's you"
+            page.controls = [Control(page, "Text a code"), Control(page, "Call with a code"),
+                             Control(page, "See more options", on_click=show_more)]
+        page.controls = [Control(page, "I didn't get a text message", on_click=show_methods)]
+        self.run_challenge(page)
+        self.assertEqual(page.clicked, ["I didn't get a text message", "See more options",
+                                        "Use authenticator app", "Continue"])
+        self.assertEqual(len(page.entered), 1)
+
+    def test_observed_unenrolled_account_stops_without_identity_recovery(self):
+        page = LoginPage("Check your text messages")
+        def show_more():
+            page.text = "Verify it's you"
+            page.controls = [Control(page, "Text a code"), Control(page, "Call with a code"),
+                             Control(page, "Verify identity a different way (takes longer)")]
+        def show_methods():
+            page.text = "Verify it's you"
+            page.controls = [Control(page, "See more options", on_click=show_more)]
+        page.controls = [Control(page, "I didn't get a text message", on_click=show_methods)]
+        with self.assertRaisesRegex(AuthenticatorError, "TOTP_METHOD_UNAVAILABLE"):
+            self.run_challenge(page)
+        self.assertEqual(page.clicked, ["I didn't get a text message", "See more options"])
+        self.assertEqual(page.entered, [])
+
     def test_foreign_origin_and_account_enrollment_are_rejected(self):
         for url in ("https://accounts.intuit.com.attacker.example/app/sign-in",
                     "http://accounts.intuit.com/app/sign-in",
