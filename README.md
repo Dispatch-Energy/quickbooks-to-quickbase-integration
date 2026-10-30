@@ -23,7 +23,7 @@ Azure Function that syncs bank accounts and pending transactions from QuickBooks
 
 - Azure CLI installed and logged in (`az login`)
 - GitHub repository created
-- QuickBooks account (without 2FA)
+- QuickBooks account with a supported login verification method
 - QuickBase user token
 
 ### 1. Run Azure Setup
@@ -93,7 +93,12 @@ If login fails due to CAPTCHA, the Azure IP may be flagged. Options:
 
 ### 2FA/MFA Required
 
-This function cannot handle 2FA. The QuickBooks account must have 2FA disabled.
+For the Container App (`app.py`), automatic authenticator codes are supported when
+`QB_TOTP_SECRET` is configured. See [authenticator setup](docs/authenticator-setup.md)
+for enrollment, Key Vault provisioning, limits, and validation. Without that
+setting, the Container App retains its manual SMS verification flow. The legacy
+Function/browser scripts have not been upgraded by this change. Disabling
+two-step verification does not prevent Intuit's device-verification challenges.
 
 ### Missing Configuration
 

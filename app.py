@@ -29,6 +29,8 @@ from pydantic import BaseModel
 from playwright.sync_api import sync_playwright
 import requests
 
+from qb_auth import complete_totp_challenge
+
 # Logging
 logging.basicConfig(
     level=logging.INFO,
@@ -137,7 +139,7 @@ def submit_code(req: CodeRequest):
         raise HTTPException(400, "Invalid code - must be 6 digits")
     
     state.pending_sms_code = code
-    logger.info(f"SMS code received: {code[:2]}****")
+    logger.info("Manual verification code received")
     return {"status": "received", "message": "Code stored - sync will continue"}
 
 
@@ -152,7 +154,7 @@ async def twilio_sms_webhook(
     Twilio webhook for incoming SMS.
     Automatically extracts verification code from Intuit SMS messages.
     """
-    logger.info(f"Twilio SMS received from {From}: {Body[:50]}...")
+    logger.info("Twilio SMS received")
     
     # Extract 6-digit code from message body
     # Intuit messages typically contain: "Your Intuit verification code is 123456"
@@ -161,7 +163,7 @@ async def twilio_sms_webhook(
     if code_match:
         code = code_match.group(1)
         state.pending_sms_code = code
-        logger.info(f"Extracted verification code: {code[:2]}****")
+        logger.info("Verification code extracted")
         
         # Return TwiML response (empty response = no reply SMS)
         return PlainTextResponse(
@@ -169,7 +171,7 @@ async def twilio_sms_webhook(
             media_type="application/xml"
         )
     else:
-        logger.warning(f"No 6-digit code found in SMS: {Body}")
+        logger.warning("No verification code found in Twilio message")
         return PlainTextResponse(
             content='<?xml version="1.0" encoding="UTF-8"?><Response></Response>',
             media_type="application/xml"
@@ -204,7 +206,7 @@ async def telnyx_sms_webhook(request: Request):
         from_number = payload.get('from', {}).get('phone_number', 'unknown')
         text = payload.get('text', '')
         
-        logger.info(f"Telnyx SMS received from {from_number}: {text[:50]}...")
+        logger.info("Telnyx SMS received")
         
         # Only process inbound messages
         if event_type != 'message.received':
@@ -217,10 +219,10 @@ async def telnyx_sms_webhook(request: Request):
         if code_match:
             code = code_match.group(1)
             state.pending_sms_code = code
-            logger.info(f"Extracted verification code: {code[:2]}****")
+            logger.info("Verification code extracted")
             return {"status": "received", "code_extracted": True}
         else:
-            logger.warning(f"No 6-digit code found in SMS: {text}")
+            logger.warning("No verification code found in Telnyx message")
             return {"status": "received", "code_extracted": False}
             
     except Exception as e:
@@ -722,76 +724,82 @@ def auto_login() -> Dict[str, str]:
                 page.wait_for_url('**/qbo.intuit.com/app/**', timeout=15000)
                 logger.info("Login successful!")
             except:
-                save_screenshot(page.screenshot())
-                page_text = page.inner_text('body').lower() if page.query_selector('body') else ''
-                
-                # Verification screen?
-                if 'verify' in page_text or 'check your text' in page_text or 'verification code' in page_text:
-                    logger.info("Verification screen detected!")
-                    
-                    # Click "Text a code" if needed
-                    if 'verify it' in page_text and 'text a code' in page_text:
-                        text_btn = page.query_selector('text="Text a code"')
-                        if text_btn:
-                            logger.info("Clicking 'Text a code'...")
-                            text_btn.click()
-                            human_delay(2, 3)
-                            save_screenshot(page.screenshot())
-                    
-                    # Wait for code
-                    logger.info("Waiting for SMS code (3 min timeout)...")
-                    logger.info("POST to /code with {\"sms_code\": \"123456\"}")
-                    
-                    state.pending_sms_code = None
-                    poll_start = time.time()
-                    timeout = 180
-                    
-                    while time.time() - poll_start < timeout:
-                        if state.pending_sms_code:
-                            sms_code = state.pending_sms_code
-                            state.pending_sms_code = None
-                            logger.info(f"Got code: {sms_code[:2]}****")
-                            
-                            # Enter code
-                            code_input = page.query_selector('input[type="text"], input[type="tel"]')
-                            if code_input:
-                                code_input.click()
-                                human_delay(0.3, 0.5)
-                                for char in sms_code:
-                                    page.keyboard.type(char, delay=random.randint(80, 150))
-                                human_delay(0.5, 1)
-                                
-                                continue_btn = page.query_selector('button:has-text("Continue"), button[type="submit"]')
-                                if continue_btn:
-                                    continue_btn.click()
-                                    human_delay(3, 5)
-                                
-                                try:
-                                    page.wait_for_url('**/qbo.intuit.com/app/**', timeout=60000)
-                                    logger.info("Verification successful!")
-                                    break
-                                except:
-                                    # Check if we're actually logged in despite timeout
-                                    save_screenshot(page.screenshot())
-                                    current_url = page.url
-                                    if 'qbo.intuit.com/app/' in current_url:
-                                        logger.info(f"Verification successful (fallback check): {current_url}")
-                                        break
-                                    else:
-                                        logger.error(f"Verification failed. Current URL: {current_url}")
-                                        raise Exception("Verification failed after entering code")
-                            else:
-                                raise Exception("Could not find code input field")
-                        
-                        time.sleep(2)
-                    else:
-                        raise Exception("SMS_VERIFICATION_TIMEOUT")
-                
-                elif 'captcha' in page_text or 'robot' in page_text:
-                    raise Exception("CAPTCHA detected - wait and retry later")
+                totp_secret = os.getenv('QB_TOTP_SECRET', '').strip()
+                if totp_secret:
+                    complete_totp_challenge(page, totp_secret)
+                    logger.info("Authenticator verification successful")
                 else:
-                    raise Exception(f"Login stuck at {page.url}")
+                    save_screenshot(page.screenshot())
+                    page_text = page.inner_text('body').lower() if page.query_selector('body') else ''
+                
+                    # Verification screen?
+                    if 'verify' in page_text or 'check your text' in page_text or 'verification code' in page_text:
+                        logger.info("Verification screen detected!")
+                    
+                        # Click "Text a code" if needed
+                        if 'verify it' in page_text and 'text a code' in page_text:
+                            text_btn = page.query_selector('text="Text a code"')
+                            if text_btn:
+                                logger.info("Clicking 'Text a code'...")
+                                text_btn.click()
+                                human_delay(2, 3)
+                                save_screenshot(page.screenshot())
+                    
+                        # Wait for code
+                        logger.info("Waiting for SMS code (3 min timeout)...")
+                        logger.info("POST to /code with {\"sms_code\": \"123456\"}")
+                    
+                        state.pending_sms_code = None
+                        poll_start = time.time()
+                        timeout = 180
+                    
+                        while time.time() - poll_start < timeout:
+                            if state.pending_sms_code:
+                                sms_code = state.pending_sms_code
+                                state.pending_sms_code = None
+                                logger.info("Manual verification code available")
+                            
+                                # Enter code
+                                code_input = page.query_selector('input[type="text"], input[type="tel"]')
+                                if code_input:
+                                    code_input.click()
+                                    human_delay(0.3, 0.5)
+                                    for char in sms_code:
+                                        page.keyboard.type(char, delay=random.randint(80, 150))
+                                    human_delay(0.5, 1)
+                                
+                                    continue_btn = page.query_selector('button:has-text("Continue"), button[type="submit"]')
+                                    if continue_btn:
+                                        continue_btn.click()
+                                        human_delay(3, 5)
+                                
+                                    try:
+                                        page.wait_for_url('**/qbo.intuit.com/app/**', timeout=60000)
+                                        logger.info("Verification successful!")
+                                        break
+                                    except:
+                                        # Check if we're actually logged in despite timeout
+                                        save_screenshot(page.screenshot())
+                                        current_url = page.url
+                                        if 'qbo.intuit.com/app/' in current_url:
+                                            logger.info(f"Verification successful (fallback check): {current_url}")
+                                            break
+                                        else:
+                                            logger.error(f"Verification failed. Current URL: {current_url}")
+                                            raise Exception("Verification failed after entering code")
+                                else:
+                                    raise Exception("Could not find code input field")
+                        
+                            time.sleep(2)
+                        else:
+                            raise Exception("SMS_VERIFICATION_TIMEOUT")
+                
+                    elif 'captcha' in page_text or 'robot' in page_text:
+                        raise Exception("CAPTCHA detected - wait and retry later")
+                    else:
+                        raise Exception(f"Login stuck at {page.url}")
         
+
         # Go to banking
         human_delay(2, 3)
         page.goto('https://qbo.intuit.com/app/banking', timeout=30000)
@@ -908,49 +916,55 @@ def auto_login_and_refresh(timeout: int = REFRESH_BROWSER_TIMEOUT) -> Dict[str, 
             try:
                 page.wait_for_url('**/qbo.intuit.com/app/**', timeout=15000)
             except:
-                page_text = page.inner_text('body')[:1000] if page.query_selector('body') else ''
-                
-                if 'verification code' in page_text.lower() or 'text message' in page_text.lower():
-                    logger.info("SMS verification required")
-                    save_screenshot(page.screenshot())
-                    
-                    sms_input = page.query_selector('input[type="tel"], input[inputmode="numeric"]')
-                    if sms_input:
-                        logger.info("Waiting for SMS code (up to 3 minutes)...")
-                        start_wait = time.time()
-                        while time.time() - start_wait < 180:
-                            if state.pending_sms_code:
-                                code = state.pending_sms_code
-                                state.pending_sms_code = None
-                                logger.info(f"Entering code: {code[:2]}****")
-                                
-                                sms_input.click()
-                                human_delay(0.3, 0.5)
-                                page.keyboard.type(code, delay=100)
-                                human_delay(0.5, 1)
-                                
-                                verify_btn = page.query_selector('button[type="submit"]')
-                                if verify_btn:
-                                    verify_btn.click()
-                                
-                                try:
-                                    page.wait_for_url('**/qbo.intuit.com/app/**', timeout=30000)
-                                    break
-                                except:
-                                    logger.error("Code verification failed")
-                                    save_screenshot(page.screenshot())
-                                    raise Exception("SMS_VERIFICATION_FAILED")
-                            
-                            time.sleep(5)
-                        else:
-                            save_screenshot(page.screenshot())
-                            raise Exception("SMS_VERIFICATION_TIMEOUT")
-                    
-                elif 'captcha' in page_text.lower() or 'robot' in page_text.lower():
-                    raise Exception("CAPTCHA detected - wait and retry later")
+                totp_secret = os.getenv('QB_TOTP_SECRET', '').strip()
+                if totp_secret:
+                    complete_totp_challenge(page, totp_secret)
+                    logger.info("Authenticator verification successful")
                 else:
-                    raise Exception(f"Login stuck at {page.url}")
+                    page_text = page.inner_text('body')[:1000] if page.query_selector('body') else ''
+                
+                    if 'verification code' in page_text.lower() or 'text message' in page_text.lower():
+                        logger.info("SMS verification required")
+                        save_screenshot(page.screenshot())
+                    
+                        sms_input = page.query_selector('input[type="tel"], input[inputmode="numeric"]')
+                        if sms_input:
+                            logger.info("Waiting for SMS code (up to 3 minutes)...")
+                            start_wait = time.time()
+                            while time.time() - start_wait < 180:
+                                if state.pending_sms_code:
+                                    code = state.pending_sms_code
+                                    state.pending_sms_code = None
+                                    logger.info("Submitting manual verification code")
+                                
+                                    sms_input.click()
+                                    human_delay(0.3, 0.5)
+                                    page.keyboard.type(code, delay=100)
+                                    human_delay(0.5, 1)
+                                
+                                    verify_btn = page.query_selector('button[type="submit"]')
+                                    if verify_btn:
+                                        verify_btn.click()
+                                
+                                    try:
+                                        page.wait_for_url('**/qbo.intuit.com/app/**', timeout=30000)
+                                        break
+                                    except:
+                                        logger.error("Code verification failed")
+                                        save_screenshot(page.screenshot())
+                                        raise Exception("SMS_VERIFICATION_FAILED")
+                            
+                                time.sleep(5)
+                            else:
+                                save_screenshot(page.screenshot())
+                                raise Exception("SMS_VERIFICATION_TIMEOUT")
+                    
+                    elif 'captcha' in page_text.lower() or 'robot' in page_text.lower():
+                        raise Exception("CAPTCHA detected - wait and retry later")
+                    else:
+                        raise Exception(f"Login stuck at {page.url}")
         
+
         # Go to banking
         human_delay(2, 3)
         print("Navigating to Banking page...", flush=True)
