@@ -38,20 +38,25 @@ class Page:
         self.clock.sleep(milliseconds / 1000)
         if self.mode in ('bank_error', 'api_pending', 'api_complete') and self.clicked:
             body = {'subJobs': [{'hasError': self.mode == 'bank_error'}],
-                    'isComplete': self.mode == 'api_complete',
+                    'isComplete': self.mode in ('api_complete', 'bank_error'),
                     'hasErrors': self.mode == 'bank_error'}
             self.listener(Mock(url='https://qbo.intuit.com/api/neo/v2/company/test/olb/manualUpdate/start',
                                status=200, json=lambda: body))
+
+    def inner_text(self, selector):
+        return 'Unable to get transactions for 5 accounts' if self.mode == 'ui_error' else ''
 
     def get_by_role(self, role, name):
         if self.mode == 'missing':
             text = None
         elif self.mode == 'already_running':
             text = 'Updating' if self.clock() < 4 else 'Update'
-        elif self.clicked and self.mode in ('success', 'timeout'):
+        elif self.clicked and self.mode in ('success', 'timeout', 'accessible_label', 'ui_error'):
             text = 'Updating' if self.clock() < 4 or self.mode == 'timeout' else 'Update'
         else:
             text = 'Update'
+        if self.mode == 'accessible_label':
+            text += ' accounts'
         button = Mock(is_visible=lambda: True, is_enabled=lambda: True)
         button.click = lambda: setattr(self, 'clicked', self.clicked + 1)
         return Mock(all=lambda: [button] if text and name.search(text) else [])
@@ -74,10 +79,13 @@ class RefreshTests(unittest.TestCase):
     def test_fast_api_confirmed_completion(self):
         self.assertEqual(self.refresh('api_complete').clicked, 1)
 
+    def test_current_qbo_accessibility_labels(self):
+        self.assertEqual(self.refresh('accessible_label').clicked, 1)
+
     def test_missing_unconfirmed_pending_error_and_timeout_fail(self):
         for mode, reason in [('missing', 'CONTROL_MISSING'), ('idle', 'START_NOT_CONFIRMED'),
                              ('timeout', 'TIMEOUT'), ('bank_error', 'BANK_ERROR'),
-                             ('api_pending', 'TIMEOUT')]:
+                             ('ui_error', 'BANK_ERROR'), ('api_pending', 'TIMEOUT')]:
             with self.subTest(mode=mode), self.assertRaisesRegex(BankRefreshError, reason):
                 self.refresh(mode)
 

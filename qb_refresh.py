@@ -25,18 +25,21 @@ def wait_for_bank_refresh(page, timeout=600, *, clock=time.monotonic, sleep=time
     A missing control, an unobserved start, a bank error reported by QuickBooks,
     or a timeout fails the sync. Never treat the absence of Updating as success.
     """
-    update = re.compile(r"^Update$", re.I)
-    updating = re.compile(r"^Updating(?:\.{3}|…)?$", re.I)
+    # Current QBO labels the button "Updating accounts" / "Update accounts"
+    # for accessibility, while its visible child span just says "Updating".
+    update = re.compile(r"^Update(?: accounts)?$", re.I)
+    updating = re.compile(r"^Updating(?: accounts)?(?:\.{3}|…)?$", re.I)
     deadline = clock() + timeout
     control_deadline = min(deadline, clock() + 30)
-    observed = {"started": False, "api_seen": False, "complete": False, "failed": False}
+    observed = {"started": False, "api_seen": False, "complete": False,
+                "failed": False, "http_error": False}
 
     def response_received(response):
         # Observe the browser's own polling; do not POST another Update job.
         if "/olb/manualUpdate/" not in response.url:
             return
         if response.status >= 400:
-            observed["failed"] = True
+            observed["http_error"] = True
             return
         try:
             body = response.json()
@@ -76,8 +79,8 @@ def wait_for_bank_refresh(page, timeout=600, *, clock=time.monotonic, sleep=time
         while clock() < deadline:
             # Playwright pumps browser events here, including response callbacks.
             page.wait_for_timeout(250)
-            if observed["failed"]:
-                raise BankRefreshError("BANK_REFRESH_BANK_ERROR")
+            if observed["http_error"]:
+                raise BankRefreshError("BANK_REFRESH_API_ERROR")
             busy = _visible_button(page, updating)
             button = _visible_button(page, update)
             if busy:
@@ -89,6 +92,12 @@ def wait_for_bank_refresh(page, timeout=600, *, clock=time.monotonic, sleep=time
                     idle_since = clock()
                 # Avoid accepting a transient button rerender as completion.
                 if clock() - idle_since >= 2:
+                    warning = re.search(r"Unable to get transactions for (\d+) accounts?",
+                                        page.inner_text('body'), re.I)
+                    if observed["failed"] or warning:
+                        count = int(warning.group(1)) if warning else 'unknown'
+                        logger.error("Bank Update finished with connection errors; accounts=%s", count)
+                        raise BankRefreshError("BANK_REFRESH_BANK_ERROR")
                     logger.info("Bank feed Update completion confirmed")
                     return
             else:
