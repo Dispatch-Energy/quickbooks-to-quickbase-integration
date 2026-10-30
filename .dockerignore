@@ -1,0 +1,8 @@
+# Only application build inputs may be uploaded to the container builder.
+**
+!.dockerignore
+!Dockerfile
+!requirements.txt
+!app.py
+!invoice_webhook.py
+!qb_auth.py
