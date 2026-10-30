@@ -59,6 +59,8 @@ QB_TOTP_PRINCIPAL_ID="$(az containerapp identity assign \
   --name qb-sync --resource-group cabbagepatchkids \
   --system-assigned --query principalId --output tsv)"
 QB_TOTP_VAULT_ID="$(az keyvault show --name qb-sync-kv --query id --output tsv)"
+QB_TOTP_SECRET_URI="$(az keyvault secret show \
+  --vault-name qb-sync-kv --name qb-totp-secret --query id --output tsv)"
 
 az role assignment create \
   --assignee-object-id "$QB_TOTP_PRINCIPAL_ID" \
@@ -69,7 +71,7 @@ az role assignment create \
 
 az containerapp secret set \
   --name qb-sync --resource-group cabbagepatchkids \
-  --secrets 'qb-totp-secret=keyvaultref:https://qb-sync-kv.vault.azure.net/secrets/qb-totp-secret,identityref:system' \
+  --secrets "qb-totp-secret=keyvaultref:$QB_TOTP_SECRET_URI,identityref:system" \
   --output none
 
 az containerapp update \
@@ -81,6 +83,11 @@ az containerapp update \
 Role assignment propagation can take time; resolve access failures before retrying
 the secret-reference step. Use secret-scoped access for this identity. Do not
 print secret values or run `az containerapp secret list --show-values`.
+
+Pin the reference to the version returned above when replacing an enrollment key.
+This prevents the service from using a cached earlier key during Key Vault's
+automatic refresh interval. A future Intuit re-enrollment requires updating the
+vault secret and the versioned Container App reference together.
 
 ## Behavior and validation
 
