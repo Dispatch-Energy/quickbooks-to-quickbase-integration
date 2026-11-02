@@ -1,9 +1,11 @@
 """
-QuickBooks → QuickBase Sync - Container App (v2.1)
+QuickBooks → QuickBase Sync - Container App (v2.2)
 
 FastAPI app with endpoints:
 - POST /sync - trigger full sync (bank feeds + GL)
     - refresh_feeds=true: clicks Update button, runs GL during wait
+- POST /sync-jobs - start a refresh job; returns a polling URL
+- GET /sync-jobs/{job_id} - 202 while running, 200 complete, error on failure
 - POST /sync-gl - trigger GL sync (OAuth-based)
 - POST /sync-all - alias for /sync
 - POST /code - submit SMS verification code (manual)
@@ -19,17 +21,19 @@ import time
 import random
 import logging
 import threading
+import uuid
 from datetime import datetime, timezone, date
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, NamedTuple
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Form, Request
-from fastapi.responses import Response, PlainTextResponse
-from pydantic import BaseModel
+from fastapi.responses import Response, PlainTextResponse, JSONResponse
+from pydantic import BaseModel, Field
 from playwright.sync_api import sync_playwright
 import requests
 
 from qb_auth import complete_totp_challenge
+from qb_refresh import wait_for_bank_refresh, select_healthy_accounts
 
 # Logging
 logging.basicConfig(
@@ -91,6 +95,11 @@ class AppState:
     sync_in_progress: bool = False
     last_sync_result: Optional[str] = None
 
+    def __init__(self):
+        self.sync_lock = threading.Lock()
+        self.jobs_lock = threading.Lock()
+        self.jobs = {}
+
 state = AppState()
 
 # =============================================================================
@@ -118,7 +127,99 @@ class SyncRequest(BaseModel):
     skip_balances: bool = False
     skip_transactions: bool = False
     refresh_feeds: bool = False  # Trigger bank feed update before scraping
-    refresh_timeout: int = REFRESH_TIMEOUT  # Max seconds to wait for refresh
+    refresh_timeout: int = Field(default=REFRESH_TIMEOUT, ge=30, le=1200)
+
+
+class SyncJobRequest(SyncRequest):
+    refresh_feeds: bool = True
+
+
+class RefreshedSession(NamedTuple):
+    cookies: Dict[str, str]
+    report: dict
+
+
+def validate_sync_config():
+    missing = [name for name, value in (
+        ('QB_USERNAME', QB_USERNAME), ('QB_PASSWORD', QB_PASSWORD),
+        ('QUICKBASE_TOKEN', QUICKBASE_TOKEN), ('ACCOUNTS_TABLE_ID', ACCOUNTS_TABLE_ID),
+        ('TRANSACTIONS_TABLE_ID', TRANSACTIONS_TABLE_ID),
+    ) if not value]
+    if missing:
+        raise HTTPException(500, f"Missing config: {', '.join(missing)}")
+
+
+def job_response(request, job):
+    location = str(request.url_for('sync_job_status', job_id=job['id']))
+    # Container Apps terminates TLS before forwarding to Uvicorn.
+    if os.getenv('CONTAINER_APP_NAME'):
+        location = location.replace('http://', 'https://', 1)
+    code = 202 if job['status'] == 'running' else (200 if job['status'] == 'complete' else 500)
+    return JSONResponse(job, status_code=code, headers={
+        'Location': location, 'Retry-After': '15', 'Cache-Control': 'no-store',
+    })
+
+
+@app.get('/sync-jobs/{job_id}', name='sync_job_status')
+def sync_job_status(job_id: str, request: Request):
+    with state.jobs_lock:
+        job = state.jobs.get(job_id)
+        if job is None:
+            # Restarted/lost operations must fail visibly, never appear complete.
+            raise HTTPException(404, 'Sync job not found; inspect logs before retrying')
+        return job_response(request, dict(job))
+
+
+@app.post('/sync-jobs')
+def start_sync_job(request: Request, req: SyncJobRequest = None):
+    validate_sync_config()
+    req = req or SyncJobRequest()
+    key = request.headers.get('Idempotency-Key') or str(uuid.uuid4())
+    if not re.fullmatch(r'[A-Za-z0-9_.:-]{1,128}', key):
+        raise HTTPException(400, 'Invalid Idempotency-Key')
+    parameters = req.model_dump()
+    with state.jobs_lock:
+        if key in state.jobs:
+            job = state.jobs[key]
+            if job['parameters'] != parameters:
+                raise HTTPException(409, 'Idempotency-Key reused with different parameters')
+            return job_response(request, dict(job))
+        if not state.sync_lock.acquire(blocking=False):
+            raise HTTPException(409, 'Another sync is running; it is not this job')
+        state.sync_in_progress = True
+        # Bound process memory without evicting a currently running job.
+        if len(state.jobs) >= 100:
+            oldest = next(iter(state.jobs))
+            del state.jobs[oldest]
+        job = {'id': key, 'status': 'running', 'parameters': parameters,
+               'started_at': datetime.now(timezone.utc).isoformat()}
+        state.jobs[key] = job
+
+    def run():
+        update = {'status': 'failed', 'error': 'Sync worker interrupted'}
+        try:
+            result = execute_sync(req)
+            update = {**result, 'status': 'complete'}
+        except Exception:
+            logger.exception('Sync job %s failed', key)
+            update = {'status': 'failed', 'error': 'Sync failed; inspect container logs'}
+        finally:
+            with state.jobs_lock:
+                state.jobs[key].update(update, finished_at=datetime.now(timezone.utc).isoformat())
+                state.sync_in_progress = False
+                state.sync_lock.release()
+
+    worker = threading.Thread(target=run, name='bank-sync', daemon=True)
+    try:
+        worker.start()
+    except Exception:
+        with state.jobs_lock:
+            state.jobs.pop(key, None)
+            state.sync_in_progress = False
+            state.sync_lock.release()
+        raise
+    with state.jobs_lock:
+        return job_response(request, dict(state.jobs[key]))
 
 
 @app.get("/health")
@@ -126,8 +227,8 @@ def health_check():
     return {
         "status": "ok", 
         "sync_in_progress": state.sync_in_progress,
-        "version": "2.1",
-        "features": ["bank_feeds", "bank_balances", "bank_feed_refresh", "gl_sync"]
+        "version": "2.2",
+        "features": ["bank_feeds", "bank_balances", "bank_feed_refresh", "gl_sync", "sync_jobs"]
     }
 
 
@@ -259,22 +360,20 @@ def trigger_sync(req: SyncRequest = None):
     2. Sync to QuickBase
     3. Run GL sync
     """
-    if state.sync_in_progress:
-        return {"status": "already_running", "message": "Sync already in progress"}
-    
-    # Validate config
-    missing = []
-    if not QB_USERNAME: missing.append('QB_USERNAME')
-    if not QB_PASSWORD: missing.append('QB_PASSWORD')
-    if not QUICKBASE_TOKEN: missing.append('QUICKBASE_TOKEN')
-    if not ACCOUNTS_TABLE_ID: missing.append('ACCOUNTS_TABLE_ID')
-    if not TRANSACTIONS_TABLE_ID: missing.append('TRANSACTIONS_TABLE_ID')
-    
-    if missing:
-        raise HTTPException(500, f"Missing config: {', '.join(missing)}")
-    
+    validate_sync_config()
+    if not state.sync_lock.acquire(blocking=False):
+        raise HTTPException(409, 'Sync already in progress')
+    state.sync_in_progress = True
     try:
-        state.sync_in_progress = True
+        return execute_sync(req)
+    finally:
+        state.sync_in_progress = False
+        state.sync_lock.release()
+
+
+def execute_sync(req: SyncRequest = None):
+    """Execute under sync_lock, owned by either the HTTP caller or job worker."""
+    try:
         state.pending_sms_code = None
         
         skip_balances = req.skip_balances if req else False
@@ -283,6 +382,7 @@ def trigger_sync(req: SyncRequest = None):
         refresh_timeout = req.refresh_timeout if req else REFRESH_BROWSER_TIMEOUT
         
         gl_result = "not run"
+        refresh_report = {}
         
         if refresh_feeds:
             # Browser-based refresh: login, click Update, wait for completion
@@ -305,7 +405,8 @@ def trigger_sync(req: SyncRequest = None):
             gl_thread.start()
             
             # Do browser-based login and refresh (this takes ~8 minutes)
-            cookies = auto_login_and_refresh(timeout=refresh_timeout)
+            session = auto_login_and_refresh(timeout=refresh_timeout)
+            cookies, refresh_report = session.cookies, session.report
             
             # Wait for GL sync to complete
             if gl_thread:
@@ -324,6 +425,14 @@ def trigger_sync(req: SyncRequest = None):
         print("Step 2: Scraping QuickBooks...", flush=True)
         accounts, transactions = scrape_quickbooks(cookies)
         print(f"Scraped {len(accounts)} accounts, {len(transactions)} transactions", flush=True)
+        source_ids = {str(account.get('qboAccountId')) for account in accounts}
+        if any(str(t['account_id']) not in source_ids for t in transactions):
+            raise RuntimeError('TRANSACTION_ACCOUNT_NOT_IN_SOURCE')
+        accounts, held_accounts = select_healthy_accounts(accounts, refresh_report)
+        eligible_ids = {str(account['qboAccountId']) for account in accounts}
+        transactions = [t for t in transactions if str(t['account_id']) in eligible_ids]
+        logger.info('Eligible bank feeds: %s accounts; holding %s failed accounts',
+                    len(accounts), len(held_accounts))
         
         print("Step 3: Syncing accounts to QuickBase...", flush=True)
         account_map = sync_accounts(accounts)
@@ -331,7 +440,7 @@ def trigger_sync(req: SyncRequest = None):
         # Sync bank balances
         if not skip_balances and BALANCES_TABLE_ID:
             print("Step 4: Syncing bank balances...", flush=True)
-            balance_result = sync_bank_balances(accounts, account_map)
+            balance_result = sync_bank_balances(accounts, account_map, replace_existing=refresh_feeds)
         else:
             balance_result = "skipped"
         
@@ -340,7 +449,8 @@ def trigger_sync(req: SyncRequest = None):
             print("Step 5: Syncing transactions...", flush=True)
             sync_transactions(transactions, account_map)
         
-        bank_result = f"{len(accounts)} accounts, {len(transactions)} txns, balances: {balance_result}"
+        bank_result = (f"{len(accounts)} accounts, {len(transactions)} txns, "
+                       f"balances: {balance_result}; held {len(held_accounts)} failed accounts")
         
         # Run GL sync if not already done during refresh
         if gl_result == "not run":
@@ -349,7 +459,10 @@ def trigger_sync(req: SyncRequest = None):
         
         result = f"Bank feeds: {bank_result} | GL: {gl_result}"
         state.last_sync_result = result
-        return {"status": "complete", "result": result}
+        return {"status": "complete", "result": result,
+                "outcome": "partial" if held_accounts else "full",
+                "held_accounts": len(held_accounts), "synced_accounts": len(accounts),
+                "synced_transactions": len(transactions), "refresh_completed": refresh_feeds}
         
     except Exception as e:
         error_msg = str(e)
@@ -361,15 +474,13 @@ def trigger_sync(req: SyncRequest = None):
             raise HTTPException(202, "SMS sent - POST to /code with {\"sms_code\": \"123456\"}")
         else:
             raise HTTPException(500, error_msg)
-    finally:
-        state.sync_in_progress = False
 
 
 @app.post("/sync-gl")
 def trigger_gl_sync():
     """Trigger GL sync (OAuth-based, for accounting data)."""
-    if state.sync_in_progress:
-        return {"status": "already_running", "message": "Sync already in progress"}
+    if not state.sync_lock.acquire(blocking=False):
+        raise HTTPException(409, 'Sync already in progress')
     
     try:
         state.sync_in_progress = True
@@ -382,6 +493,7 @@ def trigger_gl_sync():
         raise HTTPException(500, error_msg)
     finally:
         state.sync_in_progress = False
+        state.sync_lock.release()
 
 
 @app.post("/sync-all")
@@ -592,6 +704,9 @@ def run_bank_feeds_sync(skip_balances: bool = False, skip_transactions: bool = F
         
         print("Step 3: Scraping QuickBooks...", flush=True)
         accounts, transactions = scrape_quickbooks(cookies)
+        accounts, held_accounts = select_healthy_accounts(accounts, {})
+        allowed = {str(account['qboAccountId']) for account in accounts}
+        transactions = [t for t in transactions if str(t['account_id']) in allowed]
         print(f"Step 4: Scraped {len(accounts)} accounts, {len(transactions)} transactions", flush=True)
         
         print("Step 5: Syncing accounts to QuickBase...", flush=True)
@@ -813,11 +928,11 @@ def auto_login() -> Dict[str, str]:
         return cookies
 
 
-def auto_login_and_refresh(timeout: int = REFRESH_BROWSER_TIMEOUT) -> Dict[str, str]:
+def auto_login_and_refresh(timeout: int = REFRESH_BROWSER_TIMEOUT) -> RefreshedSession:
     """
     Login to QuickBooks, trigger bank feed refresh via UI, and wait for completion.
     Uses browser DOM watching instead of API polling for reliability.
-    Returns cookies when done.
+    Returns cookies and a connection-error report after Update has finished.
     """
     logger.info("Starting browser-based login and refresh...")
     print("=== BROWSER-BASED BANK FEED REFRESH ===", flush=True)
@@ -971,65 +1086,13 @@ def auto_login_and_refresh(timeout: int = REFRESH_BROWSER_TIMEOUT) -> Dict[str, 
         page.goto('https://qbo.intuit.com/app/banking', timeout=30000)
         human_delay(3, 5)
         
-        # Find and click the Update button
-        print("Looking for Update button...", flush=True)
-        update_btn = page.query_selector('button:has-text("Update")')
-        
-        if not update_btn:
-            # Maybe it's already updating?
-            updating_btn = page.query_selector('button:has-text("Updating")')
-            if updating_btn:
-                print("Already updating! Will wait for completion...", flush=True)
-            else:
-                print("Could not find Update button - continuing without refresh", flush=True)
-                cookies = {c['name']: c['value'] for c in context.cookies() if 'intuit.com' in c.get('domain', '')}
-                browser.close()
-                return cookies
-        else:
-            print("Clicking Update button...", flush=True)
-            update_btn.click()
-            human_delay(2, 3)
-        
-        # Wait for "Updating" to appear then disappear
-        print(f"Waiting for update to complete (timeout: {timeout}s)...", flush=True)
-        logger.info(f"Waiting for bank feed update (timeout: {timeout}s)")
-        
-        start_time = time.time()
-        
-        # First wait for "Updating" to appear (confirms click worked)
         try:
-            page.wait_for_selector('button:has-text("Updating")', timeout=10000)
-            print("Update started (button shows 'Updating')", flush=True)
-            logger.info("Bank feed update started")
-        except:
-            print("'Updating' button not found - may have already completed", flush=True)
-        
-        # Now wait for it to change back to "Update"
-        while time.time() - start_time < timeout:
-            elapsed = int(time.time() - start_time)
-            
-            # Check if we're back to "Update" button (not "Updating")
-            try:
-                # Look for button that has "Update" but not "Updating"
-                btn = page.query_selector('button:has-text("Update")')
-                if btn:
-                    btn_text = btn.inner_text()
-                    if 'Updating' not in btn_text and 'Update' in btn_text:
-                        print(f"Bank feed update complete! ({elapsed}s)", flush=True)
-                        logger.info(f"Bank feed update complete ({elapsed}s)")
-                        break
-            except:
-                pass
-            
-            # Progress indicator every 30 seconds
-            if elapsed % 30 == 0 and elapsed > 0:
-                print(f"[{elapsed}s] Still updating...", flush=True)
-            
-            time.sleep(1)
-        else:
-            print(f"Timeout after {timeout}s - update may still be in progress", flush=True)
-            logger.warning(f"Bank feed update timed out after {timeout}s")
-        
+            refresh_report = wait_for_bank_refresh(page, timeout=timeout)
+        except Exception:
+            save_screenshot(page.screenshot())
+            browser.close()
+            raise
+
         # Small delay then get cookies
         human_delay(2, 3)
         
@@ -1037,7 +1100,7 @@ def auto_login_and_refresh(timeout: int = REFRESH_BROWSER_TIMEOUT) -> Dict[str, 
         logger.info(f"Got session for company: {cookies.get('qbo.currentcompanyid')}")
         
         browser.close()
-        return cookies
+        return RefreshedSession(cookies, refresh_report)
 
 
 def scrape_quickbooks(cookies: Dict[str, str]):
@@ -1068,10 +1131,11 @@ def scrape_quickbooks(cookies: Dict[str, str]):
     
     accounts = resp.json().get('accounts', [])
     logger.info(f"Found {len(accounts)} accounts")
+    healthy_accounts, held_accounts = select_healthy_accounts(accounts, {})
     
     # Transactions
     all_txns = []
-    for acct in accounts:
+    for acct in healthy_accounts:
         acct_id = str(acct.get('qboAccountId', ''))
         
         resp = requests.get(
@@ -1081,7 +1145,7 @@ def scrape_quickbooks(cookies: Dict[str, str]):
             timeout=30
         )
         if resp.status_code != 200:
-            continue
+            raise RuntimeError(f'QUICKBOOKS_TRANSACTIONS_FAILED_HTTP_{resp.status_code}')
         
         for item in resp.json().get('items', []):
             amount = float(item.get('amount', 0))
@@ -1120,6 +1184,11 @@ def quickbase_request(method: str, endpoint: str, data: dict = None):
     return resp
 
 
+def require_quickbase_success(response, operation):
+    if response.status_code != 200 or response.json().get('metadata', {}).get('lineErrors'):
+        raise RuntimeError(f'QUICKBASE_{operation}_FAILED_HTTP_{response.status_code}')
+
+
 def sync_accounts(accounts: List) -> Dict[str, int]:
     """Sync accounts to QuickBase."""
     logger.info("Syncing accounts...")
@@ -1154,6 +1223,7 @@ def sync_accounts(accounts: List) -> Dict[str, int]:
         'mergeFieldId': ACCOUNT_FIELDS['quickbooks_id'],
         'fieldsToReturn': [3, ACCOUNT_FIELDS['quickbooks_id']],
     })
+    require_quickbase_success(resp, 'ACCOUNTS')
     
     # Build mapping
     account_map = {}
@@ -1180,12 +1250,12 @@ def sync_accounts(accounts: List) -> Dict[str, int]:
     return account_map
 
 
-def sync_bank_balances(accounts: List, account_map: Dict[str, int]) -> str:
+def sync_bank_balances(accounts: List, account_map: Dict[str, int], replace_existing=False) -> str:
     """
     Sync daily bank balance snapshots to QuickBase.
     
-    Creates one record per account per day. Checks for existing records
-    to prevent duplicates if run multiple times on the same day.
+    Keep one record per account/day. A confirmed refresh can update today's
+    existing record; ordinary cached-data copies only insert missing records.
     """
     logger.info("Syncing bank balances (daily snapshot)...")
     
@@ -1207,9 +1277,10 @@ def sync_bank_balances(accounts: List, account_map: Dict[str, int]) -> str:
             continue
         
         # Get balance (prefer bank balance, fall back to QB balance)
-        balance = float(acct.get('bankBalance', 0) or 0)
-        if balance == 0:
-            balance = float(acct.get('qboBalance', 0) or 0)
+        balance = acct.get('bankBalance')
+        if balance is None or balance == '':
+            balance = acct.get('qboBalance', 0)
+        balance = float(balance or 0)
         
         records.append({
             str(BALANCE_FIELDS['balance']): {'value': balance},
@@ -1218,7 +1289,7 @@ def sync_bank_balances(accounts: List, account_map: Dict[str, int]) -> str:
         })
     
     if skipped:
-        logger.info(f"Skipped {skipped} accounts (no matching parent)")
+        raise RuntimeError(f'BANK_BALANCE_MISSING_PARENTS_{skipped}')
     
     if not records:
         return "no records"
@@ -1231,42 +1302,47 @@ def sync_bank_balances(accounts: List, account_map: Dict[str, int]) -> str:
         'select': [3, BALANCE_FIELDS['date_added'], BALANCE_FIELDS['related_account']],
         'where': f"{{{BALANCE_FIELDS['date_added']}.EX.'{today}'}}"
     })
-    
-    existing_accounts = set()
-    if existing_check.status_code == 200:
-        for rec in existing_check.json().get('data', []):
-            acct_ref = rec.get(str(BALANCE_FIELDS['related_account']), {}).get('value')
-            if acct_ref:
-                existing_accounts.add(acct_ref)
+    require_quickbase_success(existing_check, 'BALANCE_QUERY')
+    existing_data = existing_check.json().get('data', [])
+    if existing_check.json().get('metadata', {}).get('totalRecords', len(existing_data)) > len(existing_data):
+        raise RuntimeError('BANK_BALANCE_QUERY_TRUNCATED')
+    existing_accounts = {}
+    for rec in existing_data:
+        acct_ref = rec.get(str(BALANCE_FIELDS['related_account']), {}).get('value')
+        if acct_ref:
+            if acct_ref in existing_accounts:
+                raise RuntimeError('BANK_BALANCE_DUPLICATE_ACCOUNT_DATE')
+            existing_accounts[acct_ref] = rec['3']['value']
     
     if existing_accounts:
         logger.info(f"Found {len(existing_accounts)} existing balance records for today")
-        original_count = len(records)
-        records = [
-            r for r in records 
-            if r[str(BALANCE_FIELDS['related_account'])]['value'] not in existing_accounts
-        ]
-        logger.info(f"Filtered to {len(records)} new balance records")
+        if replace_existing:
+            for record in records:
+                ref = record[str(BALANCE_FIELDS['related_account'])]['value']
+                if ref in existing_accounts:
+                    record['3'] = {'value': existing_accounts[ref]}
+        else:
+            records = [r for r in records
+                       if r[str(BALANCE_FIELDS['related_account'])]['value'] not in existing_accounts]
+        logger.info(f"Writing {len(records)} balance snapshots (refresh={replace_existing})")
     
     if not records:
         return "already synced today"
     
     # Insert balance records
-    logger.info(f"Inserting {len(records)} balance snapshot records...")
+    logger.info(f"Writing {len(records)} balance snapshot records...")
     
     resp = quickbase_request('POST', 'records', {
         'to': BALANCES_TABLE_ID,
         'data': records,
     })
+    require_quickbase_success(resp, 'BALANCES')
     
-    if resp.status_code == 200:
-        meta = resp.json().get('metadata', {})
-        created = len(meta.get('createdRecordIds', []))
-        logger.info(f"Created {created} balance records")
-        return f"{created} created"
-    else:
-        logger.error(f"Balance sync failed: {resp.status_code}")
-        return f"error: {resp.status_code}"
+    meta = resp.json().get('metadata', {})
+    created = len(meta.get('createdRecordIds', []))
+    updated = len(meta.get('updatedRecordIds', []))
+    logger.info(f"Balance records: {created} created, {updated} updated")
+    return f"{created} created, {updated} updated"
 
 
 def sync_transactions(transactions: List, account_map: Dict[str, int]):
@@ -1277,7 +1353,7 @@ def sync_transactions(transactions: List, account_map: Dict[str, int]):
     for t in transactions:
         parent_id = account_map.get(str(t['account_id']))
         if not parent_id:
-            continue
+            raise RuntimeError('TRANSACTION_MISSING_PARENT')
         
         internal_id = t['id']
         if internal_id:
@@ -1304,11 +1380,12 @@ def sync_transactions(transactions: List, account_map: Dict[str, int]):
     # Batch upsert
     for i in range(0, len(records), 1000):
         batch = records[i:i + 1000]
-        quickbase_request('POST', 'records', {
+        response = quickbase_request('POST', 'records', {
             'to': TRANSACTIONS_TABLE_ID,
             'data': batch,
             'mergeFieldId': TRANSACTION_FIELDS['quickbooks_id'],
         })
+        require_quickbase_success(response, 'TRANSACTIONS')
     
     logger.info(f"Synced {len(records)} transactions")
 

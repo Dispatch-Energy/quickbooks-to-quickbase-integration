@@ -1,0 +1,22 @@
+{
+  "type": "Http",
+  "inputs": {
+    "method": "POST",
+    "uri": "https://qb-sync.kindfield-16cb452b.eastus.azurecontainerapps.io/sync-jobs",
+    "headers": {
+      "Content-Type": "application/json",
+      "Idempotency-Key": "@workflow().run.name"
+    },
+    "body": {
+      "refresh_feeds": true,
+      "refresh_timeout": 1200
+    },
+    "retryPolicy": {
+      "type": "none"
+    }
+  },
+  "limit": {
+    "timeout": "PT30M"
+  },
+  "runAfter": {}
+}
