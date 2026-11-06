@@ -17,7 +17,7 @@ from collections import Counter
 ACCOUNT_KEY = 6   # Bank Accounts: Quickbooks ID (table key)
 TABLES = {        # table env var -> (reference field, extra fields to read)
     'BALANCES_TABLE_ID': (8, [7]),
-    'TRANSACTIONS_TABLE_ID': (13, []),
+    'TRANSACTIONS_TABLE_ID': (18, []),  # f13 is a read-only lookup; f18 is the reference
 }
 
 

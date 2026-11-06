@@ -279,7 +279,9 @@ class SyncTests(unittest.TestCase):
                'description': 'd', 'amount': 1.0, 'type': 'debit', 'merchant_name': 'm'}
         with patch.object(app, 'quickbase_request', return_value=response()) as qb:
             app.sync_transactions([txn], {'1': 9})
-        self.assertEqual(qb.call_args.args[2]['data'][0]['13']['value'], 1)
+        record = qb.call_args.args[2]['data'][0]
+        self.assertEqual(record['18']['value'], 1)
+        self.assertNotIn('13', record)
 
     def test_partial_quickbase_write_is_a_failure(self):
         for result in [response(status=207), response(metadata={'lineErrors': {'1': ['rejected']}})]:
