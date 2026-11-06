@@ -69,7 +69,9 @@ ACCOUNT_FIELDS = {
 # Bank Transaction field mappings
 TRANSACTION_FIELDS = {
     'quickbooks_id': 6, 'internal_id': 7, 'date': 8, 'description': 9,
-    'amount': 10, 'type': 11, 'merchant_name': 12, 'related_account': 13,
+    'amount': 10, 'type': 11, 'merchant_name': 12,
+    # f18 is the reference to Bank Account (keyed on Quickbooks ID); f13 is a lookup of its Record ID#.
+    'related_account': 18,
 }
 
 # Bank Balance field mappings (NEW)
@@ -1354,7 +1356,7 @@ def sync_transactions(transactions: List, account_map: Dict[str, int]):
     for t in transactions:
         if str(t['account_id']) not in account_map:
             raise RuntimeError('TRANSACTION_MISSING_PARENT')
-        # Keyed on Quickbooks ID, same as Bank Balances.
+        # Bank Account is keyed on Quickbooks ID, same as Bank Balances.
         parent_id = int(t['account_id'])
         
         internal_id = t['id']
