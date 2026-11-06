@@ -76,7 +76,7 @@ TRANSACTION_FIELDS = {
 BALANCE_FIELDS = {
     'balance': 6,            # Currency
     'date_added': 7,         # Date
-    'related_account': 8,    # Reference to Bank Account
+    'related_account': 8,    # Reference to Bank Account (its key: Quickbooks ID)
 }
 
 # Bank Feed Refresh Settings
@@ -1270,11 +1270,12 @@ def sync_bank_balances(accounts: List, account_map: Dict[str, int], replace_exis
     
     for acct in accounts:
         acct_id = str(acct.get('qboAccountId', ''))
-        parent_record_id = account_map.get(acct_id)
-        
-        if not parent_record_id:
+
+        if acct_id not in account_map:
             skipped += 1
             continue
+        # The Bank Account relationship is keyed on Quickbooks ID, not Record ID#.
+        parent_key = int(acct_id)
         
         # Get balance (prefer bank balance, fall back to QB balance)
         balance = acct.get('bankBalance')
@@ -1285,7 +1286,7 @@ def sync_bank_balances(accounts: List, account_map: Dict[str, int], replace_exis
         records.append({
             str(BALANCE_FIELDS['balance']): {'value': balance},
             str(BALANCE_FIELDS['date_added']): {'value': today},
-            str(BALANCE_FIELDS['related_account']): {'value': parent_record_id},
+            str(BALANCE_FIELDS['related_account']): {'value': parent_key},
         })
     
     if skipped:
@@ -1351,9 +1352,10 @@ def sync_transactions(transactions: List, account_map: Dict[str, int]):
     
     records = []
     for t in transactions:
-        parent_id = account_map.get(str(t['account_id']))
-        if not parent_id:
+        if str(t['account_id']) not in account_map:
             raise RuntimeError('TRANSACTION_MISSING_PARENT')
+        # Keyed on Quickbooks ID, same as Bank Balances.
+        parent_id = int(t['account_id'])
         
         internal_id = t['id']
         if internal_id:

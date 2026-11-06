@@ -243,7 +243,7 @@ class SyncTests(unittest.TestCase):
                 app.scrape_quickbooks({'qbo.currentcompanyid': 'test'})
 
     def test_confirmed_refresh_updates_existing_daily_record_and_keeps_zero(self):
-        existing = [{'3': {'value': 42}, '8': {'value': 9}}]
+        existing = [{'3': {'value': 42}, '8': {'value': 1}}]
         with patch.object(app, 'quickbase_request', side_effect=[response(existing), response(metadata={
                 'updatedRecordIds': [42]})]) as qb:
             result = app.sync_bank_balances([{'qboAccountId': 1, 'bankBalance': 0, 'qboBalance': 99}],
@@ -251,23 +251,35 @@ class SyncTests(unittest.TestCase):
         record = qb.call_args_list[-1].args[2]['data'][0]
         self.assertEqual(record['3']['value'], 42)
         self.assertEqual(record['6']['value'], 0)
+        self.assertEqual(record['8']['value'], 1)
         self.assertEqual(result, '0 created, 1 updated')
 
     def test_ordinary_copy_preserves_existing_daily_snapshot(self):
         with patch.object(app, 'quickbase_request', return_value=response([
-                {'3': {'value': 42}, '8': {'value': 9}}])) as qb:
+                {'3': {'value': 42}, '8': {'value': 1}}])) as qb:
             result = app.sync_bank_balances([{'qboAccountId': 1, 'bankBalance': 5}], {'1': 9})
         self.assertEqual(result, 'already synced today')
         self.assertEqual(qb.call_count, 1)
 
     def test_failed_duplicate_or_truncated_balance_query_prevents_writes(self):
-        for query in [response(status=500), response([{'3': {'value': 42}, '8': {'value': 9}},
-                                                     {'3': {'value': 43}, '8': {'value': 9}}]),
+        for query in [response(status=500), response([{'3': {'value': 42}, '8': {'value': 1}},
+                                                     {'3': {'value': 43}, '8': {'value': 1}}]),
                       response(metadata={'totalRecords': 2000})]:
             with self.subTest(query=query), patch.object(app, 'quickbase_request', return_value=query) as qb:
                 with self.assertRaises(RuntimeError):
                     app.sync_bank_balances([{'qboAccountId': 1, 'bankBalance': 5}], {'1': 9}, True)
                 self.assertEqual(qb.call_count, 1)
+
+    def test_new_balance_and_transaction_reference_quickbooks_id_not_record_id(self):
+        with patch.object(app, 'quickbase_request', side_effect=[response([]), response(metadata={
+                'createdRecordIds': [50]})]) as qb:
+            app.sync_bank_balances([{'qboAccountId': 1, 'bankBalance': 5}], {'1': 9})
+        self.assertEqual(qb.call_args_list[-1].args[2]['data'][0]['8']['value'], 1)
+        txn = {'account_id': '1', 'id': '7:x', 'olb_txn_id': 't1', 'date': '2026-11-06',
+               'description': 'd', 'amount': 1.0, 'type': 'debit', 'merchant_name': 'm'}
+        with patch.object(app, 'quickbase_request', return_value=response()) as qb:
+            app.sync_transactions([txn], {'1': 9})
+        self.assertEqual(qb.call_args.args[2]['data'][0]['13']['value'], 1)
 
     def test_partial_quickbase_write_is_a_failure(self):
         for result in [response(status=207), response(metadata={'lineErrors': {'1': ['rejected']}})]:
